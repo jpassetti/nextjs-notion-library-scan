@@ -5,10 +5,57 @@ export const runtime = "nodejs"; // important for Notion SDK
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
-function normalizeIsbn(raw: unknown) {
+function extractIsbn(raw: unknown) {
     if (!raw) return null;
-    const cleaned = String(raw).toUpperCase().replace(/[^0-9X]/g, "");
+    const s = String(raw).toUpperCase();
+
+    // Prefer ISBN-13 if present
+    const m13 = s.match(/97[89]\d{10}/);
+    if (m13) return m13[0];
+
+    // Otherwise ISBN-10 (may end in X)
+    const m10 = s.match(/\b\d{9}[\dX]\b/);
+    if (m10) return m10[0];
+
+    // Fallback: strip non ISBN-ish chars
+    const cleaned = s.replace(/[^0-9X]/g, "");
     return cleaned.length >= 10 ? cleaned : null;
+}
+
+function upgradeGoogleThumb(url: string) {
+    // Commonly works for Google Books image links
+    return url.replace("zoom=0", "zoom=2").replace("zoom=1", "zoom=2");
+}
+
+function cleanCategories(cats: string[]) {
+    const uniq = Array.from(
+        new Set(
+            cats
+                .map((c) => String(c).trim())
+                .filter(Boolean)
+        )
+    );
+    return uniq.slice(0, 8).map((name) => ({ name: name.slice(0, 50) }));
+}
+
+function todayIsoDate() {
+    return new Date().toISOString().slice(0, 10);
+}
+
+function notionPageIdCompact(pageId: string) {
+    // Notion URLs use the page id without dashes
+    return pageId.replace(/-/g, "");
+}
+
+function notionPageUrl(pageId: string) {
+    const clean = notionPageIdCompact(pageId);
+    return `https://www.notion.so/${clean}`;
+}
+
+function notionDeepLinkUrl(pageId: string) {
+    // This scheme typically opens the Notion app on iOS/macOS
+    const clean = notionPageIdCompact(pageId);
+    return `notion://www.notion.so/${clean}`;
 }
 
 async function fetchGoogleBooksByIsbn(isbn: string) {
@@ -25,6 +72,8 @@ async function fetchGoogleBooksByIsbn(isbn: string) {
     if (!item) return null;
 
     const v = item.volumeInfo ?? {};
+    const rawCoverUrl = v.imageLinks?.thumbnail ?? v.imageLinks?.smallThumbnail ?? null;
+    const coverUrl = rawCoverUrl ? upgradeGoogleThumb(rawCoverUrl) : null;
     return {
         googleId: item.id ?? null,
         title: v.title ?? null,
@@ -34,8 +83,9 @@ async function fetchGoogleBooksByIsbn(isbn: string) {
         publishedDate: v.publishedDate ?? null, // YYYY or YYYY-MM or YYYY-MM-DD
         pageCount: typeof v.pageCount === "number" ? v.pageCount : null,
         categories: Array.isArray(v.categories) ? v.categories : [],
-        coverUrl: v.imageLinks?.thumbnail ?? v.imageLinks?.smallThumbnail ?? null,
+        coverUrl,
         description: v.description ?? null,
+        sourceUrl: v.infoLink ?? v.previewLink ?? null,
     };
 }
 
@@ -47,22 +97,38 @@ function notionDate(publishedDate: string | null) {
     return null;
 }
 
-// OPTIONAL: prevent duplicates by ISBN
-async function getDataSourceIdFromDatabase(databaseId: string) {
+type DatabaseMeta = {
+    dataSourceId: string;
+    propertyNames: Set<string>;
+};
+
+let DB_META_CACHE: { databaseId: string; meta: DatabaseMeta; fetchedAt: number } | null = null;
+
+async function getDatabaseMeta(databaseId: string): Promise<DatabaseMeta> {
+    const now = Date.now();
+    if (DB_META_CACHE && DB_META_CACHE.databaseId === databaseId && now - DB_META_CACHE.fetchedAt < 5 * 60 * 1000) {
+        return DB_META_CACHE.meta;
+    }
+
     const database = await notion.databases.retrieve({ database_id: databaseId });
+
     const dataSources = (database as any)?.data_sources;
     const firstDataSourceId = Array.isArray(dataSources) ? dataSources[0]?.id : null;
-
     if (!firstDataSourceId) {
         throw new Error("No Notion data source found for NOTION_DATABASE_ID");
     }
 
-    return firstDataSourceId;
+    const propsObj = (database as any)?.properties ?? {};
+    const propertyNames = new Set(Object.keys(propsObj));
+
+    const meta = { dataSourceId: firstDataSourceId, propertyNames };
+    DB_META_CACHE = { databaseId, meta, fetchedAt: now };
+    return meta;
 }
 
 async function findExistingByIsbn(isbn: string) {
     const db = process.env.NOTION_DATABASE_ID!;
-    const dataSourceId = await getDataSourceIdFromDatabase(db);
+    const { dataSourceId } = await getDatabaseMeta(db);
     const resp = await notion.dataSources.query({
         data_source_id: dataSourceId,
         filter: {
@@ -76,8 +142,28 @@ async function findExistingByIsbn(isbn: string) {
 
 export async function POST(req: Request) {
     try {
-        const body = await req.json().catch(() => ({}));
-        const isbn = normalizeIsbn(body?.isbn);
+        const contentType = req.headers.get("content-type") || "";
+        let body: any = {};
+
+        if (contentType.includes("application/json")) {
+            body = await req.json().catch(() => ({}));
+        } else if (contentType.includes("application/x-www-form-urlencoded")) {
+            const text = await req.text().catch(() => "");
+            const params = new URLSearchParams(text);
+            body = Object.fromEntries(params.entries());
+        } else {
+            // Fallback: treat entire body as the ISBN text
+            const text = await req.text().catch(() => "");
+            body = { isbn: text };
+        }
+
+        // Also allow ISBN to come in via query string (?isbn=...)
+        const { searchParams } = new URL(req.url);
+        if (!body?.isbn && searchParams.get("isbn")) {
+            body.isbn = searchParams.get("isbn");
+        }
+
+        const isbn = extractIsbn(body?.isbn);
         if (!isbn) {
             return NextResponse.json({ ok: false, error: "Missing/invalid isbn" }, { status: 400 });
         }
@@ -87,9 +173,20 @@ export async function POST(req: Request) {
             return NextResponse.json({ ok: false, error: "NOTION_DATABASE_ID not set" }, { status: 500 });
         }
 
+        const { propertyNames } = await getDatabaseMeta(db);
+
         const existing = await findExistingByIsbn(isbn);
 
         const book = await fetchGoogleBooksByIsbn(isbn);
+
+        const notionImage = book?.coverUrl
+            ? {
+                type: "external" as const,
+                external: { url: book.coverUrl },
+            }
+            : undefined;
+
+        const scannedDate = todayIsoDate();
 
         const title = book?.title
             ? (book.subtitle ? `${book.title}: ${book.subtitle}` : book.title)
@@ -101,19 +198,47 @@ export async function POST(req: Request) {
             ISBN: { rich_text: [{ text: { content: isbn } }] },
         };
 
-        if (book?.authors?.length) properties.Authors = { rich_text: [{ text: { content: book.authors.join(", ") } }] };
-        if (book?.publisher) properties.Publisher = { rich_text: [{ text: { content: book.publisher } }] };
-        if (book?.pageCount != null) properties["Page Count"] = { number: book.pageCount };
-        if (book?.categories?.length) {
+        if (book?.authors?.length && propertyNames.has("Authors")) {
+            properties.Authors = { rich_text: [{ text: { content: book.authors.join(", ") } }] };
+        }
+        if (book?.publisher && propertyNames.has("Publisher")) {
+            properties.Publisher = { rich_text: [{ text: { content: book.publisher } }] };
+        }
+        if (book?.pageCount != null && propertyNames.has("Page Count")) {
+            properties["Page Count"] = { number: book.pageCount };
+        }
+        if (book?.categories?.length && propertyNames.has("Categories")) {
             properties.Categories = {
-                multi_select: book.categories.slice(0, 10).map((c: string) => ({ name: c })),
+                multi_select: cleanCategories(book.categories),
             };
         }
-        if (book?.coverUrl) properties["Cover URL"] = { url: book.coverUrl };
-        if (book?.googleId) properties["Google Books ID"] = { rich_text: [{ text: { content: book.googleId } }] };
+        if (book?.coverUrl && propertyNames.has("Cover URL")) {
+            properties["Cover URL"] = { url: book.coverUrl };
+        }
+        if (book?.googleId && propertyNames.has("Google Books ID")) {
+            properties["Google Books ID"] = { rich_text: [{ text: { content: book.googleId } }] };
+        }
+        if (book?.sourceUrl && propertyNames.has("Source URL")) {
+            properties["Source URL"] = { url: book.sourceUrl };
+        }
+        if (book?.description && propertyNames.has("Description")) {
+            properties.Description = {
+                rich_text: [{ text: { content: book.description.slice(0, 2000) } }],
+            };
+        }
 
         const published = notionDate(book?.publishedDate ?? null);
-        if (published) properties.Published = { date: { start: published } };
+        if (published && propertyNames.has("Published")) {
+            properties.Published = { date: { start: published } };
+        }
+
+        // Scan metadata
+        if (propertyNames.has("Last Scanned")) {
+            properties["Last Scanned"] = { date: { start: scannedDate } };
+        }
+        if (!existing && propertyNames.has("Date Added")) {
+            properties["Date Added"] = { date: { start: scannedDate } };
+        }
 
         // If exists, update; otherwise create
         let pageId: string;
@@ -121,40 +246,50 @@ export async function POST(req: Request) {
         if (existing) {
             const updated = await notion.pages.update({
                 page_id: (existing as any).id,
+                cover: notionImage,
+                icon: notionImage,
                 properties,
             });
             pageId = (updated as any).id;
         } else {
             const created = await notion.pages.create({
                 parent: { database_id: db },
-                cover: book?.coverUrl
-                    ? {
-                        type: "external",
-                        external: { url: book.coverUrl },
-                    }
-                    : undefined,
+                cover: notionImage,
+                icon: notionImage,
                 properties,
-                // optional: put description into the page content
-                children: book?.description
-                    ? [
-                        {
-                            object: "block",
-                            type: "paragraph",
-                            paragraph: {
-                                rich_text: [{ type: "text", text: { content: book.description.slice(0, 1800) } }],
+                // optional: put description into the page content only if you're not storing it in a Description property
+                children:
+                    book?.description && !propertyNames.has("Description")
+                        ? [
+                            {
+                                object: "block",
+                                type: "paragraph",
+                                paragraph: {
+                                    rich_text: [
+                                        { type: "text", text: { content: book.description.slice(0, 1800) } },
+                                    ],
+                                },
                             },
-                        },
-                    ]
-                    : [],
+                        ]
+                        : [],
             });
             pageId = (created as any).id;
         }
+
+        const url = notionPageUrl(pageId);
+        const deepLinkUrl = notionDeepLinkUrl(pageId);
+        const message = `${existing ? "Updated" : "Added"}: ${title}${book?.authors?.length ? ` — ${book.authors.join(", ")}` : ""}`;
 
         return NextResponse.json({
             ok: true,
             isbn,
             title,
+            authors: book?.authors?.join(", ") ?? "",
+            action: existing ? "updated" : "created",
+            message,
             notionPageId: pageId,
+            notionUrl: url,
+            notionDeepLinkUrl: deepLinkUrl,
             updated: Boolean(existing),
         });
     } catch (err: any) {
