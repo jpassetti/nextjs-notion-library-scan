@@ -118,7 +118,9 @@ async function getDatabaseMeta(databaseId: string): Promise<DatabaseMeta> {
         throw new Error("No Notion data source found for NOTION_DATABASE_ID");
     }
 
-    const propsObj = (database as any)?.properties ?? {};
+    // In Notion's current model, property schema primarily lives on the data source.
+    const dataSource = await notion.dataSources.retrieve({ data_source_id: firstDataSourceId });
+    const propsObj = (dataSource as any)?.properties ?? (database as any)?.properties ?? {};
     const propertyNames = new Set(Object.keys(propsObj));
 
     const meta = { dataSourceId: firstDataSourceId, propertyNames };
@@ -173,7 +175,16 @@ export async function POST(req: Request) {
             return NextResponse.json({ ok: false, error: "NOTION_DATABASE_ID not set" }, { status: 500 });
         }
 
-        const { propertyNames } = await getDatabaseMeta(db);
+        const { dataSourceId, propertyNames } = await getDatabaseMeta(db);
+
+        // Debug: return database property names without creating/updating anything
+        if (searchParams.get("debug") === "1") {
+            return NextResponse.json({
+                ok: true,
+                databaseId: db,
+                propertyNames: Array.from(propertyNames).sort(),
+            });
+        }
 
         const existing = await findExistingByIsbn(isbn);
 
@@ -253,7 +264,7 @@ export async function POST(req: Request) {
             pageId = (updated as any).id;
         } else {
             const created = await notion.pages.create({
-                parent: { database_id: db },
+                parent: { data_source_id: dataSourceId },
                 cover: notionImage,
                 icon: notionImage,
                 properties,
