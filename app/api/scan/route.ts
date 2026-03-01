@@ -5,6 +5,70 @@ export const runtime = "nodejs"; // important for Notion SDK
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
+type SuccessAction = "created" | "updated" | "exists";
+
+function successResponse(params: {
+    status?: number;
+    code: string;
+    action: SuccessAction;
+    message: string;
+    suggestion?: string;
+    data: Record<string, unknown>;
+    requestId: string;
+    durationMs: number;
+    verbose?: boolean;
+}) {
+    const { status = 200, code, action, message, suggestion, data, requestId, durationMs, verbose = false } = params;
+
+    const basePayload = {
+        ok: true,
+        status,
+        code,
+        action,
+        message,
+        suggestion: suggestion ?? null,
+        requestId,
+        durationMs,
+        timestamp: new Date().toISOString(),
+    };
+
+    return NextResponse.json(
+        verbose ? { ...basePayload, data } : basePayload,
+        { status }
+    );
+}
+
+function errorResponse(params: {
+    status: number;
+    code: string;
+    message: string;
+    suggestion?: string;
+    retryable?: boolean;
+    details?: Record<string, unknown>;
+    requestId: string;
+    durationMs: number;
+    verbose?: boolean;
+}) {
+    const { status, code, message, suggestion, retryable = false, details, requestId, durationMs, verbose = false } = params;
+
+    const basePayload = {
+        ok: false,
+        status,
+        code,
+        message,
+        suggestion: suggestion ?? null,
+        retryable,
+        requestId,
+        durationMs,
+        timestamp: new Date().toISOString(),
+    };
+
+    return NextResponse.json(
+        verbose ? { ...basePayload, details: details ?? null } : basePayload,
+        { status }
+    );
+}
+
 function extractIsbn(raw: unknown) {
     if (!raw) return null;
     const s = String(raw).toUpperCase();
@@ -143,6 +207,9 @@ async function findExistingByIsbn(isbn: string) {
 }
 
 export async function POST(req: Request) {
+    const startedAt = Date.now();
+    const requestId = globalThis.crypto?.randomUUID?.() ?? `req_${Date.now()}`;
+
     try {
         const contentType = req.headers.get("content-type") || "";
         let body: any = {};
@@ -161,32 +228,87 @@ export async function POST(req: Request) {
 
         // Also allow ISBN to come in via query string (?isbn=...)
         const { searchParams } = new URL(req.url);
+        const verbose = searchParams.get("verbose") === "1";
+
         if (!body?.isbn && searchParams.get("isbn")) {
             body.isbn = searchParams.get("isbn");
         }
 
         const isbn = extractIsbn(body?.isbn);
         if (!isbn) {
-            return NextResponse.json({ ok: false, error: "Missing/invalid isbn" }, { status: 400 });
+            return errorResponse({
+                status: 400,
+                code: "INVALID_ISBN",
+                message: "Missing or invalid ISBN.",
+                suggestion: "Scan the barcode again or enter a valid ISBN-10/ISBN-13.",
+                retryable: true,
+                requestId,
+                durationMs: Date.now() - startedAt,
+                verbose,
+            });
         }
 
         const db = process.env.NOTION_DATABASE_ID;
         if (!db) {
-            return NextResponse.json({ ok: false, error: "NOTION_DATABASE_ID not set" }, { status: 500 });
+            return errorResponse({
+                status: 500,
+                code: "SERVER_MISCONFIGURED",
+                message: "Server misconfigured: NOTION_DATABASE_ID not set.",
+                suggestion: "Set NOTION_DATABASE_ID in .env.local and redeploy/restart the app.",
+                requestId,
+                durationMs: Date.now() - startedAt,
+                verbose,
+            });
         }
+
+        const onDuplicateRaw = String(body?.onDuplicate ?? "update").toLowerCase();
+        const onDuplicate: "update" | "skip" = onDuplicateRaw === "skip" ? "skip" : "update";
 
         const { dataSourceId, propertyNames } = await getDatabaseMeta(db);
 
         // Debug: return database property names without creating/updating anything
         if (searchParams.get("debug") === "1") {
-            return NextResponse.json({
-                ok: true,
-                databaseId: db,
-                propertyNames: Array.from(propertyNames).sort(),
+            return successResponse({
+                code: "DEBUG_PROPERTIES",
+                action: "exists",
+                message: "Resolved Notion property names.",
+                data: {
+                    databaseId: db,
+                    propertyNames: Array.from(propertyNames).sort(),
+                },
+                requestId,
+                durationMs: Date.now() - startedAt,
+                verbose: true,
             });
         }
 
         const existing = await findExistingByIsbn(isbn);
+        const isDuplicate = Boolean(existing);
+
+        if (isDuplicate && onDuplicate === "skip") {
+            const pageId = (existing as any).id as string;
+            const url = notionPageUrl(pageId);
+            const deepLinkUrl = notionDeepLinkUrl(pageId);
+            return successResponse({
+                status: 200,
+                code: "BOOK_ALREADY_EXISTS",
+                action: "exists",
+                message: `Already in library: ${isbn}`,
+                suggestion: "Open existing item or rescan with onDuplicate=update to refresh metadata.",
+                data: {
+                    isbn,
+                    duplicated: true,
+                    onDuplicate,
+                    notionPageId: pageId,
+                    notionUrl: url,
+                    notionDeepLinkUrl: deepLinkUrl,
+                    speechText: `Already in library. ISBN ${isbn}.`,
+                },
+                requestId,
+                durationMs: Date.now() - startedAt,
+                verbose,
+            });
+        }
 
         const book = await fetchGoogleBooksByIsbn(isbn);
 
@@ -290,23 +412,70 @@ export async function POST(req: Request) {
         const url = notionPageUrl(pageId);
         const deepLinkUrl = notionDeepLinkUrl(pageId);
         const message = `${existing ? "Updated" : "Added"}: ${title}${book?.authors?.length ? ` — ${book.authors.join(", ")}` : ""}`;
+        const action = existing ? "updated" : "created";
+        const status = existing ? 200 : 201;
+        const metadataFound = Boolean(book);
+        const notes = metadataFound ? [] : ["No Google Books metadata found; stored ISBN and fallback title only."];
 
-        return NextResponse.json({
-            ok: true,
-            isbn,
-            title,
-            authors: book?.authors?.join(", ") ?? "",
-            action: existing ? "updated" : "created",
+        return successResponse({
+            status,
+            code: existing ? "BOOK_UPDATED" : "BOOK_CREATED",
+            action,
             message,
-            notionPageId: pageId,
-            notionUrl: url,
-            notionDeepLinkUrl: deepLinkUrl,
-            updated: Boolean(existing),
+            suggestion: existing ? "Entry refreshed successfully." : "Book added successfully.",
+            data: {
+                isbn,
+                title,
+                authors: book?.authors ?? [],
+                publisher: book?.publisher ?? null,
+                publishedDate: book?.publishedDate ?? null,
+                pageCount: book?.pageCount ?? null,
+                categories: book?.categories ?? [],
+                metadataFound,
+                notes,
+                duplicated: false,
+                onDuplicate,
+                notionPageId: pageId,
+                notionUrl: url,
+                notionDeepLinkUrl: deepLinkUrl,
+                    speechText: existing
+                        ? `Updated ${title}${book?.authors?.[0] ? ` by ${book.authors[0]}` : ""}.`
+                        : `Added ${title}${book?.authors?.[0] ? ` by ${book.authors[0]}` : ""}.`,
+            },
+                requestId,
+                durationMs: Date.now() - startedAt,
+                verbose,
         });
     } catch (err: any) {
-        return NextResponse.json(
-            { ok: false, error: err?.message ?? "Server error" },
-            { status: 500 }
-        );
+        const { searchParams } = new URL(req.url);
+        const verbose = searchParams.get("verbose") === "1";
+        const rawMessage = String(err?.message ?? "Server error");
+        const isGoogleBooksError = rawMessage.startsWith("Google Books error:");
+
+        if (isGoogleBooksError) {
+            return errorResponse({
+                status: 502,
+                code: "GOOGLE_BOOKS_UNAVAILABLE",
+                message: "Could not retrieve metadata from Google Books.",
+                suggestion: "Try scanning again in a few seconds.",
+                retryable: true,
+                details: { upstream: rawMessage },
+                requestId,
+                durationMs: Date.now() - startedAt,
+                verbose,
+            });
+        }
+
+        return errorResponse({
+            status: 500,
+            code: "SERVER_ERROR",
+            message: "Something went wrong while scanning this book.",
+            suggestion: "Try again. If it continues, check Notion integration permissions and env vars.",
+            retryable: true,
+            details: { error: rawMessage },
+            requestId,
+            durationMs: Date.now() - startedAt,
+            verbose,
+        });
     }
 }
