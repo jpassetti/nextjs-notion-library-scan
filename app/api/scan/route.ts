@@ -48,10 +48,23 @@ function notionDate(publishedDate: string | null) {
 }
 
 // OPTIONAL: prevent duplicates by ISBN
+async function getDataSourceIdFromDatabase(databaseId: string) {
+  const database = await notion.databases.retrieve({ database_id: databaseId });
+  const dataSources = (database as any)?.data_sources;
+  const firstDataSourceId = Array.isArray(dataSources) ? dataSources[0]?.id : null;
+
+  if (!firstDataSourceId) {
+    throw new Error("No Notion data source found for NOTION_DATABASE_ID");
+  }
+
+  return firstDataSourceId;
+}
+
 async function findExistingByIsbn(isbn: string) {
   const db = process.env.NOTION_DATABASE_ID!;
-  const resp = await notion.databases.query({
-    database_id: db,
+  const dataSourceId = await getDataSourceIdFromDatabase(db);
+  const resp = await notion.dataSources.query({
+    data_source_id: dataSourceId,
     filter: {
       property: "ISBN",
       rich_text: { equals: isbn },
@@ -93,7 +106,7 @@ export async function POST(req: Request) {
     if (book?.pageCount != null) properties["Page Count"] = { number: book.pageCount };
     if (book?.categories?.length) {
       properties.Categories = {
-        multi_select: book.categories.slice(0, 10).map((c) => ({ name: c })),
+        multi_select: book.categories.slice(0, 10).map((c: string) => ({ name: c })),
       };
     }
     if (book?.coverUrl) properties["Cover URL"] = { url: book.coverUrl };
