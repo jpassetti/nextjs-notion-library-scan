@@ -91,6 +91,51 @@ function upgradeGoogleThumb(url: string) {
     return url.replace("zoom=0", "zoom=2").replace("zoom=1", "zoom=2");
 }
 
+function isKnownUnavailableCoverUrl(url: string) {
+    const u = url.toLowerCase();
+    return u.includes("image_not_available") || u.includes("no_cover") || u.includes("nophoto");
+}
+
+async function urlLooksLikeImage(url: string) {
+    try {
+        const head = await fetch(url, { method: "HEAD", cache: "no-store", redirect: "follow" });
+        if (head.ok) {
+            const contentType = head.headers.get("content-type") || "";
+            if (contentType.startsWith("image/")) return true;
+        }
+
+        // Some hosts do not support HEAD consistently.
+        if (head.status === 405 || head.status === 403) {
+            const get = await fetch(url, { method: "GET", cache: "no-store", redirect: "follow" });
+            if (!get.ok) return false;
+            const contentType = get.headers.get("content-type") || "";
+            return contentType.startsWith("image/");
+        }
+
+        return false;
+    } catch {
+        return false;
+    }
+}
+
+async function resolveBestCoverUrl(isbn: string, googleCoverUrl: string | null) {
+    const openLibraryLarge = `https://covers.openlibrary.org/b/isbn/${encodeURIComponent(isbn)}-L.jpg?default=false`;
+    const openLibraryMedium = `https://covers.openlibrary.org/b/isbn/${encodeURIComponent(isbn)}-M.jpg?default=false`;
+
+    if (await urlLooksLikeImage(openLibraryLarge)) {
+        return { coverUrl: openLibraryLarge, coverSource: "openlibrary" };
+    }
+    if (await urlLooksLikeImage(openLibraryMedium)) {
+        return { coverUrl: openLibraryMedium, coverSource: "openlibrary" };
+    }
+
+    if (googleCoverUrl && !isKnownUnavailableCoverUrl(googleCoverUrl) && await urlLooksLikeImage(googleCoverUrl)) {
+        return { coverUrl: googleCoverUrl, coverSource: "google_books" };
+    }
+
+    return { coverUrl: null, coverSource: null };
+}
+
 function cleanCategories(cats: string[]) {
     const uniq = Array.from(
         new Set(
@@ -137,7 +182,8 @@ async function fetchGoogleBooksByIsbn(isbn: string) {
 
     const v = item.volumeInfo ?? {};
     const rawCoverUrl = v.imageLinks?.thumbnail ?? v.imageLinks?.smallThumbnail ?? null;
-    const coverUrl = rawCoverUrl ? upgradeGoogleThumb(rawCoverUrl) : null;
+    const upgradedGoogleCoverUrl = rawCoverUrl ? upgradeGoogleThumb(rawCoverUrl) : null;
+    const { coverUrl, coverSource } = await resolveBestCoverUrl(isbn, upgradedGoogleCoverUrl);
     return {
         googleId: item.id ?? null,
         title: v.title ?? null,
@@ -148,6 +194,7 @@ async function fetchGoogleBooksByIsbn(isbn: string) {
         pageCount: typeof v.pageCount === "number" ? v.pageCount : null,
         categories: Array.isArray(v.categories) ? v.categories : [],
         coverUrl,
+        coverSource,
         description: v.description ?? null,
         sourceUrl: v.infoLink ?? v.previewLink ?? null,
     };
@@ -431,6 +478,7 @@ export async function POST(req: Request) {
                 publishedDate: book?.publishedDate ?? null,
                 pageCount: book?.pageCount ?? null,
                 categories: book?.categories ?? [],
+                coverSource: book?.coverSource ?? null,
                 metadataFound,
                 notes,
                 duplicated: false,
