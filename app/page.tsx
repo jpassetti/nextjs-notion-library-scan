@@ -58,6 +58,12 @@ export default function Home() {
   const [onDuplicate, setOnDuplicate] = useState<"update" | "skip">("update");
   const [verbose, setVerbose] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isRunningDebug, setIsRunningDebug] = useState(false);
+  const [isRunningBackfill, setIsRunningBackfill] = useState(false);
+  const [isRunningVerboseScan, setIsRunningVerboseScan] = useState(false);
+  const [backfillDryRun, setBackfillDryRun] = useState(true);
+  const [backfillOnlyMissing, setBackfillOnlyMissing] = useState(true);
+  const [backfillMaxPages, setBackfillMaxPages] = useState(50);
   const [status, setStatus] = useState<"idle" | "success" | "error">("idle");
   const [response, setResponse] = useState<ApiPayload | null>(null);
 
@@ -92,6 +98,94 @@ export default function Home() {
     }
   }
 
+  async function runDebugCheck() {
+    setIsRunningDebug(true);
+    setStatus("idle");
+
+    try {
+      const res = await fetch("/api/scan?debug=1");
+      const payload = (await res.json()) as ApiPayload;
+      setResponse(payload);
+      setStatus(payload.ok ? "success" : "error");
+    } catch {
+      setResponse({
+        ok: false,
+        code: "NETWORK_ERROR",
+        message: "Could not run debug check.",
+        suggestion: "Confirm /api/scan is reachable and try again.",
+      });
+      setStatus("error");
+    } finally {
+      setIsRunningDebug(false);
+    }
+  }
+
+  async function runVerboseScan() {
+    if (!isbn.trim()) {
+      setResponse({
+        ok: false,
+        code: "MISSING_ISBN",
+        message: "Enter an ISBN before running a verbose scan.",
+      });
+      setStatus("error");
+      return;
+    }
+
+    setIsRunningVerboseScan(true);
+    setStatus("idle");
+
+    try {
+      const res = await fetch("/api/scan?verbose=1", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ isbn, onDuplicate }),
+      });
+
+      const payload = (await res.json()) as ApiPayload;
+      setResponse(payload);
+      setStatus(payload.ok ? "success" : "error");
+    } catch {
+      setResponse({
+        ok: false,
+        code: "NETWORK_ERROR",
+        message: "Could not run verbose scan.",
+      });
+      setStatus("error");
+    } finally {
+      setIsRunningVerboseScan(false);
+    }
+  }
+
+  async function runBackfill() {
+    setIsRunningBackfill(true);
+    setStatus("idle");
+
+    try {
+      const res = await fetch("/api/scan/backfill", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          dryRun: backfillDryRun,
+          maxPages: backfillMaxPages,
+          onlyMissing: backfillOnlyMissing,
+        }),
+      });
+
+      const payload = (await res.json()) as ApiPayload;
+      setResponse(payload);
+      setStatus(payload.ok ? "success" : "error");
+    } catch {
+      setResponse({
+        ok: false,
+        code: "NETWORK_ERROR",
+        message: "Could not run metadata backfill.",
+      });
+      setStatus("error");
+    } finally {
+      setIsRunningBackfill(false);
+    }
+  }
+
   return (
     <div className="min-h-screen bg-[radial-gradient(circle_at_10%_20%,#f4f6ff_0%,#ece8ff_35%,#fff4ec_75%,#ffffff_100%)] text-slate-900">
       <main className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-6 py-10 md:px-10 md:py-14">
@@ -114,9 +208,8 @@ export default function Home() {
             <p className="mt-2 text-sm text-slate-600">Use these endpoints for scanning, diagnostics, and metadata backfills.</p>
             <div className="mt-5 grid gap-3">
               {ROUTE_LINKS.map((route) => (
-                <a
+                <div
                   key={route.path}
-                  href={route.path}
                   className="group rounded-2xl border border-slate-200 bg-white p-4 transition hover:-translate-y-0.5 hover:border-indigo-300 hover:shadow-[0_10px_25px_rgba(76,70,180,0.12)]"
                 >
                   <div className="flex items-center justify-between gap-4">
@@ -127,8 +220,90 @@ export default function Home() {
                   </div>
                   <p className="mt-2 text-xs font-mono text-indigo-700 group-hover:text-indigo-900">{route.path}</p>
                   <p className="mt-2 text-sm leading-6 text-slate-600">{route.note}</p>
-                </a>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {route.path === "/api/scan?debug=1" ? (
+                      <button
+                        type="button"
+                        onClick={runDebugCheck}
+                        disabled={isRunningDebug}
+                        className="rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-65"
+                      >
+                        {isRunningDebug ? "Running..." : "Run Debug Check"}
+                      </button>
+                    ) : null}
+
+                    {route.path === "/api/scan/backfill" ? (
+                      <button
+                        type="button"
+                        onClick={runBackfill}
+                        disabled={isRunningBackfill}
+                        className="rounded-lg bg-violet-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-violet-700 disabled:cursor-not-allowed disabled:opacity-65"
+                      >
+                        {isRunningBackfill ? "Running..." : "Run Backfill"}
+                      </button>
+                    ) : null}
+
+                    {route.path === "/api/scan?verbose=1" ? (
+                      <button
+                        type="button"
+                        onClick={runVerboseScan}
+                        disabled={isRunningVerboseScan}
+                        className="rounded-lg bg-sky-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-65"
+                      >
+                        {isRunningVerboseScan ? "Running..." : "Run Verbose Scan"}
+                      </button>
+                    ) : null}
+
+                    <a
+                      href={route.path}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-100"
+                    >
+                      Open Route
+                    </a>
+                  </div>
+                </div>
               ))}
+            </div>
+
+            <div className="mt-5 rounded-2xl border border-violet-200 bg-violet-50/80 p-4">
+              <h3 className="text-sm font-semibold text-violet-900">Backfill Controls</h3>
+              <p className="mt-1 text-xs leading-5 text-violet-800">Configure the backfill run, then click <span className="font-semibold">Run Backfill</span> above.</p>
+              <div className="mt-3 grid gap-3 sm:grid-cols-3">
+                <label className="text-xs font-medium text-violet-900" htmlFor="backfill-max-pages">
+                  Max pages
+                  <input
+                    id="backfill-max-pages"
+                    type="number"
+                    min={1}
+                    max={200}
+                    value={backfillMaxPages}
+                    onChange={(e) => setBackfillMaxPages(Number(e.target.value || 1))}
+                    className="mt-1 w-full rounded-lg border border-violet-300 bg-white px-3 py-2 text-sm"
+                  />
+                </label>
+
+                <label className="flex items-center gap-2 rounded-lg border border-violet-200 bg-white px-3 py-2 text-xs font-medium text-violet-900">
+                  <input
+                    type="checkbox"
+                    checked={backfillDryRun}
+                    onChange={(e) => setBackfillDryRun(e.target.checked)}
+                    className="h-4 w-4"
+                  />
+                  Dry run only
+                </label>
+
+                <label className="flex items-center gap-2 rounded-lg border border-violet-200 bg-white px-3 py-2 text-xs font-medium text-violet-900">
+                  <input
+                    type="checkbox"
+                    checked={backfillOnlyMissing}
+                    onChange={(e) => setBackfillOnlyMissing(e.target.checked)}
+                    className="h-4 w-4"
+                  />
+                  Fill missing only
+                </label>
+              </div>
             </div>
           </article>
 
