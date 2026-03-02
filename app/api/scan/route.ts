@@ -122,15 +122,16 @@ async function resolveBestCoverUrl(isbn: string, googleCoverUrl: string | null) 
     const openLibraryLarge = `https://covers.openlibrary.org/b/isbn/${encodeURIComponent(isbn)}-L.jpg?default=false`;
     const openLibraryMedium = `https://covers.openlibrary.org/b/isbn/${encodeURIComponent(isbn)}-M.jpg?default=false`;
 
+    // Prefer Google first to reduce Open Library archive proxy redirects.
+    if (googleCoverUrl && !isKnownUnavailableCoverUrl(googleCoverUrl) && await urlLooksLikeImage(googleCoverUrl)) {
+        return { coverUrl: googleCoverUrl, coverSource: "google_books" };
+    }
+
     if (await urlLooksLikeImage(openLibraryLarge)) {
         return { coverUrl: openLibraryLarge, coverSource: "openlibrary" };
     }
     if (await urlLooksLikeImage(openLibraryMedium)) {
         return { coverUrl: openLibraryMedium, coverSource: "openlibrary" };
-    }
-
-    if (googleCoverUrl && !isKnownUnavailableCoverUrl(googleCoverUrl) && await urlLooksLikeImage(googleCoverUrl)) {
-        return { coverUrl: googleCoverUrl, coverSource: "google_books" };
     }
 
     return { coverUrl: null, coverSource: null };

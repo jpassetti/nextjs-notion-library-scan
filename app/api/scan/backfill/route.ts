@@ -18,6 +18,21 @@ type BackfillResultItem = {
     updatedFields?: string[];
 };
 
+type BookMetadata = {
+    googleId: string | null;
+    title: string | null;
+    subtitle: string | null;
+    authors: string[];
+    publisher: string | null;
+    publishedDate: string | null;
+    pageCount: number | null;
+    categories: string[];
+    coverUrl: string | null;
+    coverSource: "openlibrary" | "google_books" | null;
+    description: string | null;
+    sourceUrl: string | null;
+};
+
 function normalizeIsbn(raw: unknown) {
     if (!raw) return null;
     const s = String(raw).toUpperCase();
@@ -61,15 +76,16 @@ async function resolveBestCoverUrl(isbn: string, googleCoverUrl: string | null) 
     const openLibraryLarge = `https://covers.openlibrary.org/b/isbn/${encodeURIComponent(isbn)}-L.jpg?default=false`;
     const openLibraryMedium = `https://covers.openlibrary.org/b/isbn/${encodeURIComponent(isbn)}-M.jpg?default=false`;
 
+    // Prefer Google first to reduce Open Library archive proxy redirects.
+    if (googleCoverUrl && !isKnownUnavailableCoverUrl(googleCoverUrl) && await urlLooksLikeImage(googleCoverUrl)) {
+        return { coverUrl: googleCoverUrl, coverSource: "google_books" as const };
+    }
+
     if (await urlLooksLikeImage(openLibraryLarge)) {
         return { coverUrl: openLibraryLarge, coverSource: "openlibrary" as const };
     }
     if (await urlLooksLikeImage(openLibraryMedium)) {
         return { coverUrl: openLibraryMedium, coverSource: "openlibrary" as const };
-    }
-
-    if (googleCoverUrl && !isKnownUnavailableCoverUrl(googleCoverUrl) && await urlLooksLikeImage(googleCoverUrl)) {
-        return { coverUrl: googleCoverUrl, coverSource: "google_books" as const };
     }
 
     return { coverUrl: null, coverSource: null };
@@ -91,6 +107,15 @@ function notionDate(publishedDate: string | null) {
 function extractRichText(prop: any) {
     if (!prop || !Array.isArray(prop.rich_text)) return "";
     return prop.rich_text.map((r: any) => r?.plain_text ?? "").join("").trim();
+}
+
+function extractTitle(prop: any) {
+    if (!prop || !Array.isArray(prop.title)) return "";
+    return prop.title.map((r: any) => r?.plain_text ?? "").join("").trim();
+}
+
+function isUnknownTitle(value: string) {
+    return /^unknown\s+title/i.test(value.trim());
 }
 
 function hasMeaningfulValue(prop: any) {
@@ -121,7 +146,7 @@ async function getDatabaseMeta(databaseId: string): Promise<DatabaseMeta> {
     return { dataSourceId: firstDataSourceId, propertyNames: new Set(Object.keys(propsObj)) };
 }
 
-async function fetchGoogleBooksByIsbn(isbn: string) {
+async function fetchGoogleBooksByIsbn(isbn: string): Promise<BookMetadata | null> {
     const key = process.env.GOOGLE_BOOKS_API_KEY;
     const url =
         `https://www.googleapis.com/books/v1/volumes?q=isbn:${encodeURIComponent(isbn)}` +
@@ -152,6 +177,72 @@ async function fetchGoogleBooksByIsbn(isbn: string) {
         coverSource,
         description: v.description ?? null,
         sourceUrl: v.infoLink ?? v.previewLink ?? null,
+    };
+}
+
+async function fetchOpenLibraryByIsbn(isbn: string): Promise<Partial<BookMetadata> | null> {
+    const url = `https://openlibrary.org/isbn/${encodeURIComponent(isbn)}.json`;
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) return null;
+
+    const data = await res.json();
+    const title = typeof data?.title === "string" ? data.title : null;
+    const subtitle = typeof data?.subtitle === "string" ? data.subtitle : null;
+    const publishedDate = typeof data?.publish_date === "string" ? data.publish_date : null;
+    const pageCount = typeof data?.number_of_pages === "number" ? data.number_of_pages : null;
+
+    let authors: string[] = [];
+    if (Array.isArray(data?.authors) && data.authors.length) {
+        const names = await Promise.all(
+            data.authors.map(async (authorRef: any) => {
+                const key = authorRef?.key;
+                if (!key || typeof key !== "string") return null;
+                try {
+                    const authorRes = await fetch(`https://openlibrary.org${key}.json`, { cache: "no-store" });
+                    if (!authorRes.ok) return null;
+                    const authorData = await authorRes.json();
+                    return typeof authorData?.name === "string" ? authorData.name : null;
+                } catch {
+                    return null;
+                }
+            })
+        );
+        authors = names.filter((n): n is string => Boolean(n));
+    }
+
+    const { coverUrl, coverSource } = await resolveBestCoverUrl(isbn, null);
+
+    return {
+        title,
+        subtitle,
+        authors,
+        publishedDate,
+        pageCount,
+        coverUrl,
+        coverSource,
+        sourceUrl: `https://openlibrary.org/isbn/${encodeURIComponent(isbn)}`,
+    };
+}
+
+async function fetchBookMetadataByIsbn(isbn: string): Promise<BookMetadata | null> {
+    const google = await fetchGoogleBooksByIsbn(isbn);
+    const openLibrary = await fetchOpenLibraryByIsbn(isbn);
+
+    if (!google && !openLibrary) return null;
+
+    return {
+        googleId: google?.googleId ?? null,
+        title: google?.title ?? openLibrary?.title ?? null,
+        subtitle: google?.subtitle ?? openLibrary?.subtitle ?? null,
+        authors: google?.authors?.length ? google.authors : (openLibrary?.authors ?? []),
+        publisher: google?.publisher ?? null,
+        publishedDate: google?.publishedDate ?? (openLibrary?.publishedDate ?? null),
+        pageCount: google?.pageCount ?? (openLibrary?.pageCount ?? null),
+        categories: google?.categories ?? [],
+        coverUrl: google?.coverUrl ?? (openLibrary?.coverUrl ?? null),
+        coverSource: google?.coverSource ?? (openLibrary?.coverSource ?? null),
+        description: google?.description ?? null,
+        sourceUrl: google?.sourceUrl ?? (openLibrary?.sourceUrl ?? null),
     };
 }
 
@@ -220,15 +311,29 @@ export async function POST(req: Request) {
                 }
 
                 try {
-                    const book = await fetchGoogleBooksByIsbn(isbn);
+                    const book = await fetchBookMetadataByIsbn(isbn);
                     if (!book) {
                         stats.skipped += 1;
-                        results.push({ pageId, isbn, action: "skipped", reason: "No Google Books metadata found" });
+                        results.push({ pageId, isbn, action: "skipped", reason: "No metadata found in Google Books or Open Library" });
                         continue;
                     }
 
                     const updates: Record<string, unknown> = {};
                     const updatedFields: string[] = [];
+
+                    const currentTitle = extractTitle(props.Name);
+                    const mergedTitle = book.title
+                        ? (book.subtitle ? `${book.title}: ${book.subtitle}` : book.title)
+                        : null;
+
+                    if (
+                        propertyNames.has("Name") &&
+                        mergedTitle &&
+                        (!onlyMissing || !currentTitle || isUnknownTitle(currentTitle))
+                    ) {
+                        updates.Name = { title: [{ text: { content: mergedTitle.slice(0, 2000) } }] };
+                        updatedFields.push("Name");
+                    }
 
                     if (propertyNames.has("Authors") && (!onlyMissing || !hasMeaningfulValue(props.Authors)) && book.authors.length) {
                         updates.Authors = { rich_text: [{ text: { content: book.authors.join(", ") } }] };
