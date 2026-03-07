@@ -27,6 +27,30 @@ const ROUTE_LINKS: RouteLink[] = [
     note: "Primary import endpoint for Apple Shortcuts and manual form submission.",
   },
   {
+    label: "Check ISBN Exists",
+    method: "POST",
+    path: "/api/scan?mode=check&verbose=1",
+    note: "Check-only scan for Apple Shortcuts: verifies if ISBN already exists without writing.",
+  },
+  {
+    label: "Compact Shortcut Scan",
+    method: "POST",
+    path: "/api/scan?compact=1",
+    note: "Fast response payload optimized for Apple Shortcuts variable extraction.",
+  },
+  {
+    label: "Dry Run Scan",
+    method: "POST",
+    path: "/api/scan?dryRun=1&verbose=1",
+    note: "Preview the write payload without mutating Notion records.",
+  },
+  {
+    label: "Async Enrichment Scan",
+    method: "POST",
+    path: "/api/scan?enrichAsync=1&verbose=1",
+    note: "Returns quickly, then performs best-effort metadata enrichment in background.",
+  },
+  {
     label: "Scan Debug",
     method: "GET",
     path: "/api/scan?debug=1",
@@ -37,6 +61,18 @@ const ROUTE_LINKS: RouteLink[] = [
     method: "POST",
     path: "/api/scan/backfill",
     note: "Backfills previously scanned books by ISBN with missing metadata fields.",
+  },
+  {
+    label: "Missing Books By Author",
+    method: "GET",
+    path: "/api/authors/missing?author=Ursula%20K.%20Le%20Guin",
+    note: "Compares your Notion titles with Open Library works for an author.",
+  },
+  {
+    label: "Sync Missing To Notion",
+    method: "GET",
+    path: "/api/authors/missing?author=Ursula%20K.%20Le%20Guin&sync=1",
+    note: "Optionally writes missing works into a dedicated Missing Books Notion data source.",
   },
   {
     label: "Verbose Scan Example",
@@ -59,11 +95,15 @@ export default function Home() {
   const [verbose, setVerbose] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isRunningDebug, setIsRunningDebug] = useState(false);
+  const [isRunningCheckOnly, setIsRunningCheckOnly] = useState(false);
   const [isRunningBackfill, setIsRunningBackfill] = useState(false);
   const [isRunningVerboseScan, setIsRunningVerboseScan] = useState(false);
+  const [isRunningMissingByAuthor, setIsRunningMissingByAuthor] = useState(false);
   const [backfillDryRun, setBackfillDryRun] = useState(true);
   const [backfillOnlyMissing, setBackfillOnlyMissing] = useState(true);
   const [backfillMaxPages, setBackfillMaxPages] = useState(50);
+  const [missingAuthor, setMissingAuthor] = useState("");
+  const [missingMax, setMissingMax] = useState(75);
   const [status, setStatus] = useState<"idle" | "success" | "error">("idle");
   const [response, setResponse] = useState<ApiPayload | null>(null);
 
@@ -117,6 +157,42 @@ export default function Home() {
       setStatus("error");
     } finally {
       setIsRunningDebug(false);
+    }
+  }
+
+  async function runCheckOnlyScan() {
+    if (!isbn.trim()) {
+      setResponse({
+        ok: false,
+        code: "MISSING_ISBN",
+        message: "Enter an ISBN before running check-only scan.",
+      });
+      setStatus("error");
+      return;
+    }
+
+    setIsRunningCheckOnly(true);
+    setStatus("idle");
+
+    try {
+      const res = await fetch("/api/scan?mode=check&verbose=1", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ isbn }),
+      });
+
+      const payload = (await res.json()) as ApiPayload;
+      setResponse(payload);
+      setStatus(payload.ok ? "success" : "error");
+    } catch {
+      setResponse({
+        ok: false,
+        code: "NETWORK_ERROR",
+        message: "Could not run check-only scan.",
+      });
+      setStatus("error");
+    } finally {
+      setIsRunningCheckOnly(false);
     }
   }
 
@@ -186,6 +262,42 @@ export default function Home() {
     }
   }
 
+  async function runMissingByAuthor() {
+    const author = missingAuthor.trim();
+    if (!author) {
+      setResponse({
+        ok: false,
+        code: "MISSING_AUTHOR",
+        message: "Enter an author name before running missing-books report.",
+      });
+      setStatus("error");
+      return;
+    }
+
+    setIsRunningMissingByAuthor(true);
+    setStatus("idle");
+
+    try {
+      const query = new URLSearchParams({
+        author,
+        maxMissing: String(Math.max(10, missingMax)),
+      });
+      const res = await fetch(`/api/authors/missing?${query.toString()}`);
+      const payload = (await res.json()) as ApiPayload;
+      setResponse(payload);
+      setStatus(payload.ok ? "success" : "error");
+    } catch {
+      setResponse({
+        ok: false,
+        code: "NETWORK_ERROR",
+        message: "Could not run missing-books-by-author report.",
+      });
+      setStatus("error");
+    } finally {
+      setIsRunningMissingByAuthor(false);
+    }
+  }
+
   return (
     <div className="min-h-screen bg-[radial-gradient(circle_at_10%_20%,#f4f6ff_0%,#ece8ff_35%,#fff4ec_75%,#ffffff_100%)] text-slate-900">
       <main className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-6 py-10 md:px-10 md:py-14">
@@ -232,6 +344,17 @@ export default function Home() {
                       </button>
                     ) : null}
 
+                    {route.path === "/api/scan?mode=check&verbose=1" ? (
+                      <button
+                        type="button"
+                        onClick={runCheckOnlyScan}
+                        disabled={isRunningCheckOnly}
+                        className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-65"
+                      >
+                        {isRunningCheckOnly ? "Running..." : "Check ISBN Exists"}
+                      </button>
+                    ) : null}
+
                     {route.path === "/api/scan/backfill" ? (
                       <button
                         type="button"
@@ -251,6 +374,17 @@ export default function Home() {
                         className="rounded-lg bg-sky-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-65"
                       >
                         {isRunningVerboseScan ? "Running..." : "Run Verbose Scan"}
+                      </button>
+                    ) : null}
+
+                    {route.path === "/api/authors/missing?author=Ursula%20K.%20Le%20Guin" ? (
+                      <button
+                        type="button"
+                        onClick={runMissingByAuthor}
+                        disabled={isRunningMissingByAuthor}
+                        className="rounded-lg bg-amber-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-amber-700 disabled:cursor-not-allowed disabled:opacity-65"
+                      >
+                        {isRunningMissingByAuthor ? "Running..." : "Run Missing Report"}
                       </button>
                     ) : null}
 
@@ -357,7 +491,57 @@ export default function Home() {
               >
                 {isSubmitting ? "Importing..." : "Import Book"}
               </button>
+
+              <button
+                type="button"
+                onClick={runCheckOnlyScan}
+                disabled={isRunningCheckOnly}
+                className="inline-flex w-full items-center justify-center rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 px-4 py-3 text-sm font-semibold text-white shadow-[0_10px_24px_rgba(24,132,112,0.28)] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-65"
+              >
+                {isRunningCheckOnly ? "Checking..." : "Check ISBN Only"}
+              </button>
             </form>
+
+            <div className="mt-5 rounded-2xl border border-amber-200 bg-amber-50/70 p-4">
+              <h3 className="text-sm font-semibold text-amber-900">Missing Books By Author</h3>
+              <p className="mt-1 text-xs leading-5 text-amber-800">
+                Compare your current Notion titles against Open Library works for an author.
+              </p>
+              <div className="mt-3 grid gap-3 sm:grid-cols-[1fr_auto]">
+                <label className="text-xs font-medium text-amber-900" htmlFor="missing-author">
+                  Author name
+                  <input
+                    id="missing-author"
+                    type="text"
+                    value={missingAuthor}
+                    onChange={(e) => setMissingAuthor(e.target.value)}
+                    placeholder="Ursula K. Le Guin"
+                    className="mt-1 w-full rounded-lg border border-amber-300 bg-white px-3 py-2 text-sm"
+                  />
+                </label>
+
+                <label className="text-xs font-medium text-amber-900" htmlFor="missing-max">
+                  Max missing
+                  <input
+                    id="missing-max"
+                    type="number"
+                    min={10}
+                    max={500}
+                    value={missingMax}
+                    onChange={(e) => setMissingMax(Number(e.target.value || 10))}
+                    className="mt-1 w-full rounded-lg border border-amber-300 bg-white px-3 py-2 text-sm"
+                  />
+                </label>
+              </div>
+              <button
+                type="button"
+                onClick={runMissingByAuthor}
+                disabled={isRunningMissingByAuthor}
+                className="mt-3 inline-flex w-full items-center justify-center rounded-lg bg-amber-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-amber-700 disabled:cursor-not-allowed disabled:opacity-65"
+              >
+                {isRunningMissingByAuthor ? "Running..." : "Run Missing Report"}
+              </button>
+            </div>
 
             <div
               className={`mt-5 rounded-xl border px-4 py-3 text-sm ${

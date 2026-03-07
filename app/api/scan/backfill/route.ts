@@ -5,6 +5,22 @@ export const runtime = "nodejs";
 
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
+type JsonObject = Record<string, unknown>;
+type NotionUpdateArgs = Parameters<typeof notion.pages.update>[0];
+
+function asRecord(value: unknown): JsonObject | null {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    return value as JsonObject;
+}
+
+function asArray(value: unknown): unknown[] {
+    return Array.isArray(value) ? value : [];
+}
+
+function getString(value: unknown) {
+    return typeof value === "string" ? value : null;
+}
+
 type DatabaseMeta = {
     dataSourceId: string;
     propertyNames: Set<string>;
@@ -104,45 +120,59 @@ function notionDate(publishedDate: string | null) {
     return null;
 }
 
-function extractRichText(prop: any) {
-    if (!prop || !Array.isArray(prop.rich_text)) return "";
-    return prop.rich_text.map((r: any) => r?.plain_text ?? "").join("").trim();
+function extractRichText(prop: unknown) {
+    const p = asRecord(prop);
+    const parts = asArray(p?.rich_text);
+    return parts
+        .map((r) => getString(asRecord(r)?.plain_text) ?? "")
+        .join("")
+        .trim();
 }
 
-function extractTitle(prop: any) {
-    if (!prop || !Array.isArray(prop.title)) return "";
-    return prop.title.map((r: any) => r?.plain_text ?? "").join("").trim();
+function extractTitle(prop: unknown) {
+    const p = asRecord(prop);
+    const parts = asArray(p?.title);
+    return parts
+        .map((r) => getString(asRecord(r)?.plain_text) ?? "")
+        .join("")
+        .trim();
 }
 
 function isUnknownTitle(value: string) {
     return /^unknown\s+title/i.test(value.trim());
 }
 
-function hasMeaningfulValue(prop: any) {
-    if (!prop || typeof prop !== "object") return false;
-    if (prop.type === "rich_text") return extractRichText(prop).length > 0;
-    if (prop.type === "title") {
-        const t = Array.isArray(prop.title) ? prop.title.map((r: any) => r?.plain_text ?? "").join("").trim() : "";
+function hasMeaningfulValue(prop: unknown) {
+    const p = asRecord(prop);
+    if (!p) return false;
+    if (p.type === "rich_text") return extractRichText(p).length > 0;
+    if (p.type === "title") {
+        const t = asArray(p.title)
+            .map((r) => getString(asRecord(r)?.plain_text) ?? "")
+            .join("")
+            .trim();
         return t.length > 0;
     }
-    if (prop.type === "number") return prop.number !== null && prop.number !== undefined;
-    if (prop.type === "url") return typeof prop.url === "string" && prop.url.length > 0;
-    if (prop.type === "multi_select") return Array.isArray(prop.multi_select) && prop.multi_select.length > 0;
-    if (prop.type === "date") return Boolean(prop.date?.start);
+    if (p.type === "number") return p.number !== null && p.number !== undefined;
+    if (p.type === "url") return typeof p.url === "string" && p.url.length > 0;
+    if (p.type === "multi_select") return asArray(p.multi_select).length > 0;
+    if (p.type === "date") return Boolean(asRecord(p.date)?.start);
     return false;
 }
 
 async function getDatabaseMeta(databaseId: string): Promise<DatabaseMeta> {
     const database = await notion.databases.retrieve({ database_id: databaseId });
-    const dataSources = (database as any)?.data_sources;
-    const firstDataSourceId = Array.isArray(dataSources) ? dataSources[0]?.id : null;
+    const databaseObj = asRecord(database);
+    const dataSources = asArray(databaseObj?.data_sources);
+    const firstDataSourceId = getString(asRecord(dataSources[0])?.id);
 
     if (!firstDataSourceId) {
         throw new Error("No Notion data source found for NOTION_DATABASE_ID");
     }
 
     const dataSource = await notion.dataSources.retrieve({ data_source_id: firstDataSourceId });
-    const propsObj = (dataSource as any)?.properties ?? (database as any)?.properties ?? {};
+    const dataSourceObj = asRecord(dataSource);
+    const propsObj = asRecord(dataSourceObj?.properties) ?? asRecord(databaseObj?.properties) ?? {};
     return { dataSourceId: firstDataSourceId, propertyNames: new Set(Object.keys(propsObj)) };
 }
 
@@ -194,14 +224,14 @@ async function fetchOpenLibraryByIsbn(isbn: string): Promise<Partial<BookMetadat
     let authors: string[] = [];
     if (Array.isArray(data?.authors) && data.authors.length) {
         const names = await Promise.all(
-            data.authors.map(async (authorRef: any) => {
-                const key = authorRef?.key;
+            data.authors.map(async (authorRef: unknown) => {
+                const key = getString(asRecord(authorRef)?.key);
                 if (!key || typeof key !== "string") return null;
                 try {
                     const authorRes = await fetch(`https://openlibrary.org${key}.json`, { cache: "no-store" });
                     if (!authorRes.ok) return null;
                     const authorData = await authorRes.json();
-                    return typeof authorData?.name === "string" ? authorData.name : null;
+                    return getString(asRecord(authorData)?.name);
                 } catch {
                     return null;
                 }
@@ -246,10 +276,12 @@ async function fetchBookMetadataByIsbn(isbn: string): Promise<BookMetadata | nul
     };
 }
 
-function extractIsbnFromPage(properties: any) {
-    const isbnProp = properties?.ISBN;
+function extractIsbnFromPage(properties: unknown) {
+    const props = asRecord(properties);
+    const isbnProp = props?.ISBN;
     if (!isbnProp) return null;
-    if (isbnProp.type === "rich_text") return normalizeIsbn(extractRichText(isbnProp));
+    const isbnObj = asRecord(isbnProp);
+    if (isbnObj?.type === "rich_text") return normalizeIsbn(extractRichText(isbnObj));
     return null;
 }
 
@@ -295,13 +327,14 @@ export async function POST(req: Request) {
                 start_cursor: cursor,
             });
 
-            for (const row of resp.results as any[]) {
+            for (const row of resp.results) {
+                const rowObj = asRecord(row);
                 if (stats.scanned >= maxPages) break;
-                if (row?.object !== "page") continue;
+                if (rowObj?.object !== "page") continue;
 
                 stats.scanned += 1;
-                const pageId = row.id as string;
-                const props = row.properties ?? {};
+                const pageId = String(rowObj?.id ?? "");
+                const props = asRecord(rowObj?.properties) ?? {};
                 const isbn = extractIsbnFromPage(props);
 
                 if (!isbn) {
@@ -395,14 +428,19 @@ export async function POST(req: Request) {
 
                     await notion.pages.update({
                         page_id: pageId,
-                        properties: updates as any,
+                        properties: updates as NotionUpdateArgs["properties"],
                     });
 
                     stats.updated += 1;
                     results.push({ pageId, isbn, action: "updated", updatedFields });
-                } catch (error: any) {
+                } catch (error: unknown) {
                     stats.errors += 1;
-                    results.push({ pageId, isbn, action: "error", reason: String(error?.message ?? "Unknown error") });
+                    results.push({
+                        pageId,
+                        isbn,
+                        action: "error",
+                        reason: error instanceof Error ? error.message : "Unknown error",
+                    });
                 }
             }
 
@@ -419,13 +457,13 @@ export async function POST(req: Request) {
             durationMs: Date.now() - startedAt,
             results,
         });
-    } catch (err: any) {
+    } catch (err: unknown) {
         return NextResponse.json(
             {
                 ok: false,
                 code: "BACKFILL_FAILED",
                 message: "Backfill failed.",
-                error: String(err?.message ?? "Server error"),
+                error: err instanceof Error ? err.message : "Server error",
                 durationMs: Date.now() - startedAt,
             },
             { status: 500 }
