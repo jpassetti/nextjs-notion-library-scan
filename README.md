@@ -68,7 +68,10 @@ Run the development server:
 npm run dev
 ```
 
-Then open http://localhost:3000.
+Then open one of these URLs:
+
+- Local: http://localhost:3000
+- Production: https://nextjs-notion-library-scan.vercel.app/
 
 ## Quality Gates
 
