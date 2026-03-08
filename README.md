@@ -22,6 +22,13 @@ Next.js API and dashboard for scanning ISBNs into a Notion books database.
 	- Uses canonical Open Library work-key matching when available.
 	- Optional `sync=1` writes missing works into a separate Notion data source.
 
+- `POST /api/authors/backfill`
+	- Backfills `OpenLibrary Author Key` for existing rows in the Authors database.
+	- Body options:
+		- `dryRun` (default `false`): preview changes without writing.
+		- `onlyMissing` (default `true`): only update rows with blank key.
+		- `maxPages` (default `200`, max `500`): author rows to process.
+
 - `POST /api/scan/backfill`
 	- Backfills metadata for previously scanned books.
 
@@ -52,6 +59,7 @@ Optional variables for author relation syncing:
 - `NOTION_BOOK_AUTHOR_RELATION_PROPERTY`: Relation property name on books database.
 	- If omitted, the app auto-detects a relation property that points to the authors data source.
 - `NOTION_AUTHOR_NAME_PROPERTY`: Name field on authors database (default: `Name`).
+- `NOTION_AUTHOR_OPENLIBRARY_KEY_PROPERTY`: Author key field on authors database (default: `OpenLibrary Author Key`).
 
 Optional variables for missing-books sync table:
 
