@@ -553,6 +553,20 @@ function notionDate(publishedDate: string | null) {
     return null;
 }
 
+function resolvePropertyNameCaseInsensitive(propertyNames: Set<string>, preferred: string) {
+    if (propertyNames.has(preferred)) return preferred;
+    for (const name of propertyNames) {
+        if (name.toLowerCase() === preferred.toLowerCase()) return name;
+    }
+    return null;
+}
+
+function hasDateStartValue(prop: unknown) {
+    const propObj = asRecord(prop);
+    if (!propObj || propObj.type !== "date") return false;
+    return Boolean(asRecord(propObj.date)?.start);
+}
+
 type DatabaseMeta = {
     dataSourceId: string;
     propertyNames: Set<string>;
@@ -1276,6 +1290,17 @@ export async function POST(req: Request) {
         // Scan metadata
         if (propertyNames.has("Last Scanned")) {
             properties["Last Scanned"] = { date: { start: scannedDate } };
+        }
+        const dateScannedProperty = resolvePropertyNameCaseInsensitive(
+            propertyNames,
+            process.env.NOTION_DATE_SCANNED_PROPERTY ?? "Date Scanned"
+        );
+        if (dateScannedProperty) {
+            const existingProps = asRecord(asRecord(existing)?.properties) ?? {};
+            const hasDateScanned = existing ? hasDateStartValue(existingProps[dateScannedProperty]) : false;
+            if (!existing || !hasDateScanned) {
+                properties[dateScannedProperty] = { date: { start: scannedDate } };
+            }
         }
         if (!existing && propertyNames.has("Date Added")) {
             properties["Date Added"] = { date: { start: scannedDate } };
