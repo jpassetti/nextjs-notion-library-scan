@@ -38,6 +38,7 @@ function parseAliasesMap(raw: string | undefined) {
 }
 
 const AUTHOR_ALIASES = parseAliasesMap(process.env.AUTHOR_ALIASES_JSON);
+const AUTHOR_OPENLIBRARY_KEY_CACHE = new Map<string, string | null>();
 
 function normalizeAuthorName(raw: unknown) {
     const cleaned = String(raw ?? "")
@@ -253,12 +254,121 @@ function resolveAuthorNameProperty(authorsMeta: DatabaseMeta) {
     return null;
 }
 
+function resolveAuthorOpenLibraryKeyProperty(authorsMeta: DatabaseMeta) {
+    const configured = process.env.NOTION_AUTHOR_OPENLIBRARY_KEY_PROPERTY ?? "OpenLibrary Author Key";
+    if (authorsMeta.propertyNames.has(configured)) return configured;
+    return null;
+}
+
+function normalizeAuthorLookupName(name: string) {
+    return name
+        .toLowerCase()
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function extractOpenLibraryAuthorKey(raw: unknown) {
+    const key = String(raw ?? "").trim();
+    if (!key) return null;
+    return key.startsWith("/authors/") ? key.replace("/authors/", "") : key;
+}
+
+async function fetchOpenLibraryAuthorKeyByName(authorName: string) {
+    const cacheKey = normalizeAuthorLookupName(authorName);
+    if (AUTHOR_OPENLIBRARY_KEY_CACHE.has(cacheKey)) {
+        return AUTHOR_OPENLIBRARY_KEY_CACHE.get(cacheKey) ?? null;
+    }
+
+    const url = `https://openlibrary.org/search/authors.json?q=${encodeURIComponent(authorName)}`;
+    try {
+        const res = await fetch(url, { cache: "no-store" });
+        if (!res.ok) {
+            AUTHOR_OPENLIBRARY_KEY_CACHE.set(cacheKey, null);
+            return null;
+        }
+
+        const data = await res.json();
+        const docs = asArray(asRecord(data)?.docs);
+        if (!docs.length) {
+            AUTHOR_OPENLIBRARY_KEY_CACHE.set(cacheKey, null);
+            return null;
+        }
+
+        const target = normalizeAuthorLookupName(authorName);
+        const exact = docs.find((doc) => {
+            const docObj = asRecord(doc);
+            const name = normalizeAuthorLookupName(String(docObj?.name ?? ""));
+            return Boolean(name) && name === target;
+        });
+        const chosen = asRecord(exact ?? docs[0]);
+        const key = extractOpenLibraryAuthorKey(chosen?.key);
+
+        AUTHOR_OPENLIBRARY_KEY_CACHE.set(cacheKey, key);
+        return key;
+    } catch {
+        AUTHOR_OPENLIBRARY_KEY_CACHE.set(cacheKey, null);
+        return null;
+    }
+}
+
+function readTextPropertyValue(prop: unknown, schemaType: string | null) {
+    const propObj = asRecord(prop);
+    if (!propObj || !schemaType) return "";
+
+    if (schemaType === "rich_text") {
+        return asArray(propObj.rich_text)
+            .map((part) => getString(asRecord(part)?.plain_text) ?? "")
+            .join("")
+            .trim();
+    }
+
+    if (schemaType === "title") {
+        return asArray(propObj.title)
+            .map((part) => getString(asRecord(part)?.plain_text) ?? "")
+            .join("")
+            .trim();
+    }
+
+    if (schemaType === "url") {
+        return getString(propObj.url) ?? "";
+    }
+
+    return "";
+}
+
+function buildOpenLibraryAuthorKeyPropertyValue(schemaType: string | null, key: string) {
+    const content = key.slice(0, 2000);
+    if (!content || !schemaType) return null;
+
+    if (schemaType === "rich_text") {
+        return { rich_text: [{ text: { content } }] };
+    }
+    if (schemaType === "title") {
+        return { title: [{ text: { content } }] };
+    }
+    if (schemaType === "url") {
+        return { url: `https://openlibrary.org/authors/${encodeURIComponent(content)}` };
+    }
+
+    return null;
+}
+
 async function findOrCreateAuthorPageId(params: {
     authorName: string;
     authorsMeta: DatabaseMeta;
     nameProperty: string;
+    openLibraryAuthorKeyProperty: string | null;
+    openLibraryAuthorKey: string | null;
+    dryRun: boolean;
 }) {
-    const { authorName, authorsMeta, nameProperty } = params;
+    const {
+        authorName,
+        authorsMeta,
+        nameProperty,
+        openLibraryAuthorKeyProperty,
+        openLibraryAuthorKey,
+        dryRun,
+    } = params;
     const schemaType = asRecord(authorsMeta.propertySchemas?.[nameProperty])?.type;
     if (schemaType !== "title" && schemaType !== "rich_text") {
         return null;
@@ -283,7 +393,31 @@ async function findOrCreateAuthorPageId(params: {
 
     const existingObj = asRecord(query.results?.[0]);
     const existingId = getString(existingObj?.id);
-    if (existingId) return existingId;
+    if (existingId) {
+        const keySchemaType = openLibraryAuthorKeyProperty
+            ? getString(asRecord(authorsMeta.propertySchemas?.[openLibraryAuthorKeyProperty])?.type)
+            : null;
+
+        if (!dryRun && openLibraryAuthorKeyProperty && openLibraryAuthorKey && keySchemaType) {
+            const existingProps = asRecord(existingObj?.properties) ?? {};
+            const existingKey = readTextPropertyValue(existingProps[openLibraryAuthorKeyProperty], keySchemaType);
+            if (!existingKey) {
+                const keyValue = buildOpenLibraryAuthorKeyPropertyValue(keySchemaType, openLibraryAuthorKey);
+                if (keyValue) {
+                    await notion.pages.update({
+                        page_id: existingId,
+                        properties: {
+                            [openLibraryAuthorKeyProperty]: keyValue,
+                        } as NotionUpdateArgs["properties"],
+                    });
+                }
+            }
+        }
+
+        return existingId;
+    }
+
+    if (dryRun) return null;
 
     const content = authorName.slice(0, 2000);
     const properties: Record<string, unknown> =
@@ -299,6 +433,16 @@ async function findOrCreateAuthorPageId(params: {
                 },
             };
 
+    const keySchemaType = openLibraryAuthorKeyProperty
+        ? getString(asRecord(authorsMeta.propertySchemas?.[openLibraryAuthorKeyProperty])?.type)
+        : null;
+    if (openLibraryAuthorKeyProperty && openLibraryAuthorKey && keySchemaType) {
+        const keyValue = buildOpenLibraryAuthorKeyPropertyValue(keySchemaType, openLibraryAuthorKey);
+        if (keyValue) {
+            properties[openLibraryAuthorKeyProperty] = keyValue;
+        }
+    }
+
     const created = await notion.pages.create({
         parent: { data_source_id: authorsMeta.dataSourceId },
         properties: properties as NotionCreateArgs["properties"],
@@ -308,7 +452,7 @@ async function findOrCreateAuthorPageId(params: {
     return String(createdObj?.id ?? "");
 }
 
-async function buildAuthorRelationUpdate(authors: string[], bookMeta: DatabaseMeta) {
+async function buildAuthorRelationUpdate(authors: string[], bookMeta: DatabaseMeta, dryRun: boolean) {
     const dedupedAuthors = uniqueAuthorNames(authors);
     if (!dedupedAuthors.length) {
         return {
@@ -355,12 +499,20 @@ async function buildAuthorRelationUpdate(authors: string[], bookMeta: DatabaseMe
         };
     }
 
+    const openLibraryAuthorKeyProperty = resolveAuthorOpenLibraryKeyProperty(authorsMeta);
+
     const authorPageIds: string[] = [];
     for (const authorName of dedupedAuthors) {
+        const openLibraryAuthorKey = openLibraryAuthorKeyProperty
+            ? await fetchOpenLibraryAuthorKeyByName(authorName)
+            : null;
         const id = await findOrCreateAuthorPageId({
             authorName,
             authorsMeta,
             nameProperty,
+            openLibraryAuthorKeyProperty,
+            openLibraryAuthorKey,
+            dryRun,
         });
         if (id) authorPageIds.push(id);
     }
@@ -574,7 +726,7 @@ export async function POST(req: Request) {
                         dataSourceId,
                         propertyNames,
                         propertySchemas,
-                    });
+                    }, dryRun);
 
                     if (
                         authorRelation.enabled &&
