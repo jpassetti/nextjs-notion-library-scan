@@ -6,6 +6,8 @@ export const runtime = "nodejs";
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
 type JsonObject = Record<string, unknown>;
+type NotionQueryArgs = Parameters<typeof notion.dataSources.query>[0];
+type NotionCreateArgs = Parameters<typeof notion.pages.create>[0];
 type NotionUpdateArgs = Parameters<typeof notion.pages.update>[0];
 
 function asRecord(value: unknown): JsonObject | null {
@@ -21,9 +23,47 @@ function getString(value: unknown) {
     return typeof value === "string" ? value : null;
 }
 
+function parseAliasesMap(raw: string | undefined) {
+    if (!raw) return new Map<string, string>();
+    try {
+        const parsed = JSON.parse(raw) as Record<string, string>;
+        const out = new Map<string, string>();
+        for (const [k, v] of Object.entries(parsed)) {
+            out.set(k.trim().toLowerCase(), String(v).trim());
+        }
+        return out;
+    } catch {
+        return new Map<string, string>();
+    }
+}
+
+const AUTHOR_ALIASES = parseAliasesMap(process.env.AUTHOR_ALIASES_JSON);
+
+function normalizeAuthorName(raw: unknown) {
+    const cleaned = String(raw ?? "")
+        .replace(/\s+/g, " ")
+        .trim();
+    const alias = AUTHOR_ALIASES.get(cleaned.toLowerCase());
+    return alias ?? cleaned;
+}
+
+function uniqueAuthorNames(authors: string[]) {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const author of authors) {
+        const normalized = normalizeAuthorName(author);
+        const key = normalized.toLowerCase();
+        if (!normalized || seen.has(key)) continue;
+        seen.add(key);
+        out.push(normalized);
+    }
+    return out;
+}
+
 type DatabaseMeta = {
     dataSourceId: string;
     propertyNames: Set<string>;
+    propertySchemas: Record<string, unknown>;
 };
 
 type BackfillResultItem = {
@@ -157,6 +197,7 @@ function hasMeaningfulValue(prop: unknown) {
     if (p.type === "url") return typeof p.url === "string" && p.url.length > 0;
     if (p.type === "multi_select") return asArray(p.multi_select).length > 0;
     if (p.type === "date") return Boolean(asRecord(p.date)?.start);
+    if (p.type === "relation") return asArray(p.relation).length > 0;
     return false;
 }
 
@@ -173,7 +214,163 @@ async function getDatabaseMeta(databaseId: string): Promise<DatabaseMeta> {
     const dataSource = await notion.dataSources.retrieve({ data_source_id: firstDataSourceId });
     const dataSourceObj = asRecord(dataSource);
     const propsObj = asRecord(dataSourceObj?.properties) ?? asRecord(databaseObj?.properties) ?? {};
-    return { dataSourceId: firstDataSourceId, propertyNames: new Set(Object.keys(propsObj)) };
+    return {
+        dataSourceId: firstDataSourceId,
+        propertyNames: new Set(Object.keys(propsObj)),
+        propertySchemas: propsObj,
+    };
+}
+
+function findRelationPropertyToDataSource(meta: DatabaseMeta, targetDataSourceId: string) {
+    for (const [name, schema] of Object.entries(meta.propertySchemas)) {
+        const schemaObj = asRecord(schema);
+        if (schemaObj?.type !== "relation") continue;
+        const relation = asRecord(schemaObj?.relation);
+        if (!relation) continue;
+        if (relation.data_source_id === targetDataSourceId || relation.database_id === targetDataSourceId) {
+            return name;
+        }
+    }
+    return null;
+}
+
+async function getAuthorsDatabaseMeta(): Promise<DatabaseMeta | null> {
+    const authorsDb = process.env.NOTION_AUTHORS_DATABASE_ID;
+    if (!authorsDb) return null;
+    return getDatabaseMeta(authorsDb);
+}
+
+function resolveAuthorNameProperty(authorsMeta: DatabaseMeta) {
+    const configured = process.env.NOTION_AUTHOR_NAME_PROPERTY ?? "Name";
+    if (authorsMeta.propertyNames.has(configured)) return configured;
+
+    for (const [name, schema] of Object.entries(authorsMeta.propertySchemas)) {
+        if (asRecord(schema)?.type === "title") return name;
+    }
+    for (const [name, schema] of Object.entries(authorsMeta.propertySchemas)) {
+        if (asRecord(schema)?.type === "rich_text") return name;
+    }
+    return null;
+}
+
+async function findOrCreateAuthorPageId(params: {
+    authorName: string;
+    authorsMeta: DatabaseMeta;
+    nameProperty: string;
+}) {
+    const { authorName, authorsMeta, nameProperty } = params;
+    const schemaType = asRecord(authorsMeta.propertySchemas?.[nameProperty])?.type;
+    if (schemaType !== "title" && schemaType !== "rich_text") {
+        return null;
+    }
+
+    const filter =
+        schemaType === "title"
+            ? {
+                property: nameProperty,
+                title: { equals: authorName },
+            }
+            : {
+                property: nameProperty,
+                rich_text: { equals: authorName },
+            };
+
+    const query = await notion.dataSources.query({
+        data_source_id: authorsMeta.dataSourceId,
+        filter: filter as NotionQueryArgs["filter"],
+        page_size: 1,
+    });
+
+    const existingObj = asRecord(query.results?.[0]);
+    const existingId = getString(existingObj?.id);
+    if (existingId) return existingId;
+
+    const content = authorName.slice(0, 2000);
+    const properties: Record<string, unknown> =
+        schemaType === "title"
+            ? {
+                [nameProperty]: {
+                    title: [{ text: { content } }],
+                },
+            }
+            : {
+                [nameProperty]: {
+                    rich_text: [{ text: { content } }],
+                },
+            };
+
+    const created = await notion.pages.create({
+        parent: { data_source_id: authorsMeta.dataSourceId },
+        properties: properties as NotionCreateArgs["properties"],
+    });
+
+    const createdObj = asRecord(created);
+    return String(createdObj?.id ?? "");
+}
+
+async function buildAuthorRelationUpdate(authors: string[], bookMeta: DatabaseMeta) {
+    const dedupedAuthors = uniqueAuthorNames(authors);
+    if (!dedupedAuthors.length) {
+        return {
+            relationProperty: null as string | null,
+            authorPageIds: [] as string[],
+            enabled: false,
+            reason: "No authors found in metadata.",
+        };
+    }
+
+    const authorsMeta = await getAuthorsDatabaseMeta();
+    if (!authorsMeta) {
+        return {
+            relationProperty: null as string | null,
+            authorPageIds: [] as string[],
+            enabled: false,
+            reason: "NOTION_AUTHORS_DATABASE_ID is not configured.",
+        };
+    }
+
+    const configuredRelationProperty = process.env.NOTION_BOOK_AUTHOR_RELATION_PROPERTY;
+    const relationProperty = configuredRelationProperty
+        ? (bookMeta.propertyNames.has(configuredRelationProperty) ? configuredRelationProperty : null)
+        : findRelationPropertyToDataSource(bookMeta, authorsMeta.dataSourceId);
+
+    if (!relationProperty) {
+        return {
+            relationProperty: null as string | null,
+            authorPageIds: [] as string[],
+            enabled: false,
+            reason: configuredRelationProperty
+                ? `Configured relation property not found: ${configuredRelationProperty}`
+                : "No relation property found in book database for authors data source.",
+        };
+    }
+
+    const nameProperty = resolveAuthorNameProperty(authorsMeta);
+    if (!nameProperty) {
+        return {
+            relationProperty,
+            authorPageIds: [] as string[],
+            enabled: false,
+            reason: "Authors database has no title/rich_text field for author names.",
+        };
+    }
+
+    const authorPageIds: string[] = [];
+    for (const authorName of dedupedAuthors) {
+        const id = await findOrCreateAuthorPageId({
+            authorName,
+            authorsMeta,
+            nameProperty,
+        });
+        if (id) authorPageIds.push(id);
+    }
+
+    return {
+        relationProperty,
+        authorPageIds,
+        enabled: true,
+        reason: null as string | null,
+    };
 }
 
 async function fetchGoogleBooksByIsbn(isbn: string): Promise<BookMetadata | null> {
@@ -291,7 +488,7 @@ export async function POST(req: Request) {
     try {
         const body = await req.json().catch(() => ({}));
         const dryRun = Boolean(body?.dryRun);
-        const maxPages = Math.max(1, Math.min(200, Number(body?.maxPages ?? 50)));
+        const maxPages = Math.max(1, Math.min(5000, Number(body?.maxPages ?? 500)));
         const onlyMissing = body?.onlyMissing !== false;
 
         const db = process.env.NOTION_DATABASE_ID;
@@ -306,7 +503,7 @@ export async function POST(req: Request) {
             );
         }
 
-        const { dataSourceId, propertyNames } = await getDatabaseMeta(db);
+        const { dataSourceId, propertyNames, propertySchemas } = await getDatabaseMeta(db);
 
         const results: BackfillResultItem[] = [];
         const stats = {
@@ -371,6 +568,24 @@ export async function POST(req: Request) {
                     if (propertyNames.has("Authors") && (!onlyMissing || !hasMeaningfulValue(props.Authors)) && book.authors.length) {
                         updates.Authors = { rich_text: [{ text: { content: book.authors.join(", ") } }] };
                         updatedFields.push("Authors");
+                    }
+
+                    const authorRelation = await buildAuthorRelationUpdate(book.authors ?? [], {
+                        dataSourceId,
+                        propertyNames,
+                        propertySchemas,
+                    });
+
+                    if (
+                        authorRelation.enabled &&
+                        authorRelation.relationProperty &&
+                        authorRelation.authorPageIds.length &&
+                        (!onlyMissing || !hasMeaningfulValue(props[authorRelation.relationProperty]))
+                    ) {
+                        updates[authorRelation.relationProperty] = {
+                            relation: authorRelation.authorPageIds.map((id) => ({ id })),
+                        };
+                        updatedFields.push(authorRelation.relationProperty);
                     }
 
                     if (propertyNames.has("Publisher") && (!onlyMissing || !hasMeaningfulValue(props.Publisher)) && book.publisher) {

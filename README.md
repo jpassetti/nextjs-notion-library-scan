@@ -31,6 +31,8 @@ Next.js API and dashboard for scanning ISBNs into a Notion books database.
 
 - `POST /api/scan/backfill`
 	- Backfills metadata for previously scanned books.
+	- Also upserts authors into Authors DB and links Library rows via relation when author env vars are configured.
+	- Body options: `dryRun`, `onlyMissing`, `maxPages`.
 
 ## Environment Variables
 
