@@ -268,6 +268,154 @@ function extractIsbn(raw: unknown) {
     return cleaned.length >= 10 ? cleaned : null;
 }
 
+function normalizeIsbnForValidation(raw: string) {
+    const cleaned = raw.toUpperCase().replace(/[^0-9X]/g, "");
+    if (cleaned.length === 10) return cleaned;
+    if (cleaned.length === 13) return cleaned;
+    return cleaned;
+}
+
+function isValidIsbn10(isbn10: string) {
+    if (!/^\d{9}[\dX]$/.test(isbn10)) return false;
+    let sum = 0;
+    for (let i = 0; i < 9; i += 1) {
+        sum += (10 - i) * Number(isbn10[i]);
+    }
+    const check = isbn10[9] === "X" ? 10 : Number(isbn10[9]);
+    sum += check;
+    return sum % 11 === 0;
+}
+
+function isValidIsbn13(isbn13: string) {
+    if (!/^\d{13}$/.test(isbn13)) return false;
+    let sum = 0;
+    for (let i = 0; i < 12; i += 1) {
+        const digit = Number(isbn13[i]);
+        sum += i % 2 === 0 ? digit : digit * 3;
+    }
+    const expectedCheck = (10 - (sum % 10)) % 10;
+    return expectedCheck === Number(isbn13[12]);
+}
+
+function validateIsbnChecksum(raw: string) {
+    const normalized = normalizeIsbnForValidation(raw);
+    const format = normalized.length === 10 ? "ISBN10" : (normalized.length === 13 ? "ISBN13" : null);
+    if (!format) {
+        return {
+            normalized,
+            format: null,
+            valid: false,
+            reason: "ISBN must be 10 or 13 characters after normalization.",
+        };
+    }
+
+    if (format === "ISBN10") {
+        const valid = isValidIsbn10(normalized);
+        return {
+            normalized,
+            format,
+            valid,
+            reason: valid ? "ISBN-10 checksum passed." : "ISBN-10 checksum failed.",
+        };
+    }
+
+    const valid = isValidIsbn13(normalized);
+    return {
+        normalized,
+        format,
+        valid,
+        reason: valid ? "ISBN-13 checksum passed." : "ISBN-13 checksum failed.",
+    };
+}
+
+function normalizeTextInput(raw: unknown) {
+    const value = String(raw ?? "").trim();
+    return value.length ? value : null;
+}
+
+function parseAuthorsInput(raw: unknown) {
+    if (Array.isArray(raw)) {
+        return raw
+            .map((part) => normalizeTextInput(part))
+            .filter((part): part is string => Boolean(part));
+    }
+
+    const text = normalizeTextInput(raw);
+    if (!text) return [];
+    return text
+        .split(",")
+        .map((part) => part.trim())
+        .filter(Boolean);
+}
+
+function parseNumberInput(raw: unknown) {
+    if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+    const text = String(raw ?? "").trim();
+    if (!text) return null;
+    const n = Number(text);
+    return Number.isFinite(n) ? n : null;
+}
+
+function buildTextLikeProperty(schemaType: string | null, content: string) {
+    const trimmed = content.trim();
+    if (!trimmed || !schemaType) return null;
+
+    if (schemaType === "rich_text") {
+        return { rich_text: [{ text: { content: trimmed.slice(0, 2000) } }] };
+    }
+    if (schemaType === "title") {
+        return { title: [{ text: { content: trimmed.slice(0, 2000) } }] };
+    }
+    if (schemaType === "select") {
+        return { select: { name: trimmed.slice(0, 100) } };
+    }
+    if (schemaType === "multi_select") {
+        return { multi_select: [{ name: trimmed.slice(0, 100) }] };
+    }
+
+    return null;
+}
+
+function normalizeComparableText(raw: unknown) {
+    return String(raw ?? "")
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function resolveMultiSelectNamesAgainstSchema(params: {
+    inputNames: string[];
+    propertySchema: unknown;
+}) {
+    const { inputNames, propertySchema } = params;
+    const schemaObj = asRecord(propertySchema);
+    const options = asArray(asRecord(schemaObj?.multi_select)?.options);
+    const optionNameByNormalized = new Map<string, string>();
+
+    for (const opt of options) {
+        const optName = normalizeTextInput(asRecord(opt)?.name);
+        if (!optName) continue;
+        optionNameByNormalized.set(normalizeComparableText(optName), optName);
+    }
+
+    const dedup = new Set<string>();
+    const resolved: string[] = [];
+    for (const rawName of inputNames) {
+        const cleaned = normalizeTextInput(rawName);
+        if (!cleaned) continue;
+
+        const normalized = normalizeComparableText(cleaned);
+        if (!normalized || dedup.has(normalized)) continue;
+        dedup.add(normalized);
+
+        const existingName = optionNameByNormalized.get(normalized);
+        resolved.push((existingName ?? cleaned).slice(0, 50));
+    }
+
+    return resolved;
+}
+
 function upgradeGoogleThumb(url: string) {
     // Commonly works for Google Books image links
     return url.replace("zoom=0", "zoom=2").replace("zoom=1", "zoom=2");
@@ -852,6 +1000,58 @@ async function findOrCreateAuthorPageId(params: {
         return existingId;
     }
 
+    // If exact match misses, try a case/punctuation-insensitive match against likely candidates.
+    const normalizedTarget = normalizeComparableText(authorName);
+    const token = normalizeTextInput(authorName)?.split(/\s+/)[0] ?? null;
+    if (normalizedTarget && token) {
+        const containsFilter =
+            schemaType === "title"
+                ? {
+                    property: nameProperty,
+                    title: { contains: token },
+                }
+                : {
+                    property: nameProperty,
+                    rich_text: { contains: token },
+                };
+
+        const looseQuery = await notion.dataSources.query({
+            data_source_id: authorsMeta.dataSourceId,
+            filter: containsFilter as NotionQueryArgs["filter"],
+            page_size: 25,
+        });
+
+        for (const candidate of looseQuery.results ?? []) {
+            const candidateObj = asRecord(candidate);
+            const candidateProps = asRecord(candidateObj?.properties) ?? {};
+            const candidateName = readTextPropertyValue(candidateProps[nameProperty], schemaType);
+            if (normalizeComparableText(candidateName) !== normalizedTarget) continue;
+
+            const candidateId = getString(candidateObj?.id);
+            if (!candidateId) continue;
+
+            const keySchemaType = openLibraryAuthorKeyProperty
+                ? getString(asRecord(authorsMeta.propertySchemas?.[openLibraryAuthorKeyProperty])?.type)
+                : null;
+            if (openLibraryAuthorKeyProperty && openLibraryAuthorKey && keySchemaType) {
+                const existingKey = readTextPropertyValue(candidateProps[openLibraryAuthorKeyProperty], keySchemaType);
+                if (!existingKey) {
+                    const keyValue = buildOpenLibraryAuthorKeyPropertyValue(keySchemaType, openLibraryAuthorKey);
+                    if (keyValue) {
+                        await notion.pages.update({
+                            page_id: candidateId,
+                            properties: {
+                                [openLibraryAuthorKeyProperty]: keyValue,
+                            } as NotionUpdateArgs["properties"],
+                        });
+                    }
+                }
+            }
+
+            return candidateId;
+        }
+    }
+
     const content = authorName.slice(0, 2000);
     const properties: Record<string, unknown> =
         schemaType === "title"
@@ -971,6 +1171,65 @@ async function findExistingByIsbn(isbn: string) {
     return resp.results?.[0] ?? null;
 }
 
+async function findExistingByTitle(title: string) {
+    const db = process.env.NOTION_DATABASE_ID!;
+    const { dataSourceId, propertyNames, propertySchemas } = await getDatabaseMeta(db);
+    const titleProperty = resolvePropertyNameCaseInsensitive(propertyNames, "Name") ?? "Name";
+    const titleSchemaType = getString(asRecord(propertySchemas[titleProperty])?.type);
+    if (titleSchemaType !== "title" && titleSchemaType !== "rich_text") return null;
+
+    const exactFilter =
+        titleSchemaType === "title"
+            ? {
+                property: titleProperty,
+                title: { equals: title },
+            }
+            : {
+                property: titleProperty,
+                rich_text: { equals: title },
+            };
+
+    const exactResp = await notion.dataSources.query({
+        data_source_id: dataSourceId,
+        filter: exactFilter as NotionQueryArgs["filter"],
+        page_size: 1,
+    });
+    const exact = exactResp.results?.[0] ?? null;
+    if (exact) return exact;
+
+    const normalizedTarget = normalizeComparableText(title);
+    const token = normalizeTextInput(title)?.split(/\s+/)[0] ?? null;
+    if (!normalizedTarget || !token) return null;
+
+    const containsFilter =
+        titleSchemaType === "title"
+            ? {
+                property: titleProperty,
+                title: { contains: token },
+            }
+            : {
+                property: titleProperty,
+                rich_text: { contains: token },
+            };
+
+    const looseResp = await notion.dataSources.query({
+        data_source_id: dataSourceId,
+        filter: containsFilter as NotionQueryArgs["filter"],
+        page_size: 50,
+    });
+
+    for (const candidate of looseResp.results ?? []) {
+        const candidateObj = asRecord(candidate);
+        const candidateProps = asRecord(candidateObj?.properties) ?? {};
+        const candidateTitle = readTextPropertyValue(candidateProps[titleProperty], titleSchemaType);
+        if (normalizeComparableText(candidateTitle) === normalizedTarget) {
+            return candidate;
+        }
+    }
+
+    return null;
+}
+
 export async function POST(req: Request) {
     const startedAt = Date.now();
     const requestId = globalThis.crypto?.randomUUID?.() ?? `req_${Date.now()}`;
@@ -1014,18 +1273,35 @@ export async function POST(req: Request) {
         const compact = parseBool(searchParams.get("compact") ?? body?.compact);
         const dryRun = parseBool(searchParams.get("dryRun") ?? body?.dryRun);
         const enrichAsync = parseBool(searchParams.get("enrichAsync") ?? body?.enrichAsync);
+        const modeRaw = String(body?.mode ?? searchParams.get("mode") ?? "").toLowerCase();
+        const manualMode = modeRaw === "manual" || parseBool(body?.manual);
 
         if (!body?.isbn && searchParams.get("isbn")) {
             body.isbn = searchParams.get("isbn");
         }
 
         const isbn = extractIsbn(body?.isbn);
-        if (!isbn) {
+        const manualTitle = normalizeTextInput(body?.title);
+
+        if (!isbn && !manualMode) {
             return errorResponse({
                 status: 400,
                 code: "INVALID_ISBN",
                 message: "Missing or invalid ISBN.",
                 suggestion: "Scan the barcode again or enter a valid ISBN-10/ISBN-13.",
+                retryable: true,
+                requestId,
+                durationMs: Date.now() - startedAt,
+                verbose,
+            });
+        }
+
+        if (manualMode && !manualTitle) {
+            return errorResponse({
+                status: 400,
+                code: "MISSING_TITLE",
+                message: "Manual entry requires a title.",
+                suggestion: "Provide a title when adding a book without an ISBN.",
                 retryable: true,
                 requestId,
                 durationMs: Date.now() - startedAt,
@@ -1048,15 +1324,20 @@ export async function POST(req: Request) {
 
         const onDuplicateRaw = String(body?.onDuplicate ?? "update").toLowerCase();
         const onDuplicate: "update" | "skip" = onDuplicateRaw === "skip" ? "skip" : "update";
-        const modeRaw = String(body?.mode ?? searchParams.get("mode") ?? "").toLowerCase();
+        const validateOnly =
+            modeRaw === "validate" ||
+            body?.validateOnly === true ||
+            searchParams.get("validate") === "1" ||
+            searchParams.get("validateOnly") === "1";
         const checkOnly =
             modeRaw === "check" ||
             body?.checkOnly === true ||
             searchParams.get("check") === "1" ||
             searchParams.get("checkOnly") === "1";
         const idempotencyHeader = normalizeHeaderIdempotencyKey(req);
+        const idempotentEntity = isbn ?? manualTitle ?? "manual_entry";
         const idempotencyKey = idempotencyHeader
-            ? `${idempotencyHeader}:${isbn}:${checkOnly ? "check" : "write"}:${onDuplicate}`
+            ? `${idempotencyHeader}:${idempotentEntity}:${validateOnly ? "validate" : (checkOnly ? "check" : "write")}:${onDuplicate}:${manualMode ? "manual" : "isbn"}`
             : null;
 
         const idempotentHit = maybeGetIdempotent(idempotencyKey);
@@ -1091,10 +1372,150 @@ export async function POST(req: Request) {
             return NextResponse.json(payload, { status: 200 });
         }
 
-        const existing = await findExistingByIsbn(isbn);
+        const existing = isbn
+            ? await findExistingByIsbn(isbn)
+            : (manualTitle ? await findExistingByTitle(manualTitle) : null);
         const isDuplicate = Boolean(existing);
 
+        if (validateOnly) {
+            if (!isbn) {
+                return errorResponse({
+                    status: 400,
+                    code: "VALIDATE_REQUIRES_ISBN",
+                    message: "Validate mode requires an ISBN.",
+                    suggestion: "Provide an ISBN to validate checksum and metadata match.",
+                    retryable: false,
+                    requestId,
+                    durationMs: Date.now() - startedAt,
+                    verbose,
+                });
+            }
+
+            const validation = validateIsbnChecksum(isbn);
+            const checksumValid = validation.valid;
+            const metadata = checksumValid ? await fetchBookMetadataByIsbn(isbn).catch(() => null) : null;
+            const metadataFound = Boolean(metadata && (metadata.title || metadata.authors.length > 0));
+
+            if (!checksumValid) {
+                const status = 422;
+                const payload = {
+                    ok: false,
+                    status,
+                    code: "ISBN_CHECKSUM_INVALID",
+                    action: "validate",
+                    message: `ISBN failed checksum validation: ${isbn}`,
+                    suggestion: "Re-scan the barcode or verify the typed digits, including check digit.",
+                    requestId,
+                    durationMs: Date.now() - startedAt,
+                    timestamp: new Date().toISOString(),
+                    data: {
+                        isbn,
+                        format: validation.format,
+                        checksumValid: false,
+                        validationReason: validation.reason,
+                        existsInLibrary: isDuplicate,
+                    },
+                };
+
+                await writeAuditEvent({
+                    requestId,
+                    route: "/api/scan",
+                    isbn,
+                    action: "validate",
+                    status,
+                    code: "ISBN_CHECKSUM_INVALID",
+                    durationMs: Date.now() - startedAt,
+                    metadata: { existsInLibrary: isDuplicate },
+                });
+                maybeStoreIdempotent(idempotencyKey, status, payload);
+                return NextResponse.json(payload, { status });
+            }
+
+            const code = metadataFound ? "ISBN_VALID_MATCHED" : "ISBN_VALID_UNCONFIRMED";
+            const message = metadataFound
+                ? `ISBN is valid and maps to a known book: ${isbn}`
+                : `ISBN checksum is valid, but no provider metadata was found: ${isbn}`;
+            const suggestion = metadataFound
+                ? (isDuplicate
+                    ? "ISBN is valid and already in your library."
+                    : "ISBN is valid. You can import it if needed.")
+                : "The ISBN format is valid; confirm with another source if needed.";
+
+            const payload = compact
+                ? makeCompactPayload({
+                    ok: true,
+                    code,
+                    message,
+                    isbn,
+                    title: metadata?.title ?? null,
+                    firstAuthor: metadata?.authors?.[0] ?? null,
+                    exists: isDuplicate,
+                    speechText: metadataFound
+                        ? `ISBN looks correct. ${metadata?.title ?? "Book found"}.`
+                        : `ISBN checksum is valid, but I could not confirm book metadata.`,
+                    requestId,
+                    durationMs: Date.now() - startedAt,
+                })
+                : {
+                    ok: true,
+                    status: 200,
+                    code,
+                    action: "validate",
+                    message,
+                    suggestion,
+                    requestId,
+                    durationMs: Date.now() - startedAt,
+                    timestamp: new Date().toISOString(),
+                    data: {
+                        isbn,
+                        format: validation.format,
+                        checksumValid: true,
+                        validationReason: validation.reason,
+                        existsInLibrary: isDuplicate,
+                        metadataFound,
+                        metadata: metadataFound
+                            ? {
+                                title: metadata?.title ?? null,
+                                authors: metadata?.authors ?? [],
+                                publishedDate: metadata?.publishedDate ?? null,
+                                provider: metadata?.provider ?? null,
+                                sourceUrl: metadata?.sourceUrl ?? null,
+                            }
+                            : null,
+                    },
+                };
+
+            await writeAuditEvent({
+                requestId,
+                route: "/api/scan",
+                isbn,
+                action: "validate",
+                status: 200,
+                code,
+                durationMs: Date.now() - startedAt,
+                metadata: {
+                    existsInLibrary: isDuplicate,
+                    metadataFound,
+                },
+            });
+            maybeStoreIdempotent(idempotencyKey, 200, payload);
+            return NextResponse.json(payload, { status: 200 });
+        }
+
         if (checkOnly) {
+            if (!isbn) {
+                return errorResponse({
+                    status: 400,
+                    code: "CHECK_REQUIRES_ISBN",
+                    message: "Check-only mode requires an ISBN.",
+                    suggestion: "Provide an ISBN or run a normal manual add request.",
+                    retryable: false,
+                    requestId,
+                    durationMs: Date.now() - startedAt,
+                    verbose,
+                });
+            }
+
             const existingObj = asRecord(existing);
             const pageId = isDuplicate ? getString(existingObj?.id) : null;
             const url = pageId ? notionPageUrl(pageId) : null;
@@ -1210,7 +1631,7 @@ export async function POST(req: Request) {
             return NextResponse.json(payload, { status: 200 });
         }
 
-        const book = await fetchBookMetadataByIsbn(isbn);
+        const book = isbn ? await fetchBookMetadataByIsbn(isbn) : null;
 
         const notionImage = book?.coverUrl
             ? {
@@ -1220,22 +1641,39 @@ export async function POST(req: Request) {
             : undefined;
 
         const scannedDate = todayIsoDate();
+        const manualAuthors = parseAuthorsInput(body?.authors);
+        const manualPublisher = normalizeTextInput(body?.publisher);
+        const manualPublishedDate = normalizeTextInput(body?.publishedDate);
+        const manualDescription = normalizeTextInput(body?.description);
+        const manualSourceUrl = normalizeTextInput(body?.sourceUrl);
+        const manualEdition = normalizeTextInput(body?.edition);
+        const manualCategories = parseAuthorsInput(body?.categories);
+        const manualPageCount = parseNumberInput(body?.pageCount);
+        const effectiveAuthors = book?.authors?.length ? book.authors : manualAuthors;
+        const effectivePublisher = book?.publisher ?? manualPublisher;
+        const effectivePageCount = book?.pageCount ?? manualPageCount;
+        const effectiveCategories = book?.categories?.length ? book.categories : manualCategories;
+        const effectiveDescription = book?.description ?? manualDescription;
+        const effectiveSourceUrl = book?.sourceUrl ?? manualSourceUrl;
 
         const title = book?.title
             ? (book.subtitle ? `${book.title}: ${book.subtitle}` : book.title)
-            : `Unknown title (${isbn})`;
+            : (manualTitle ?? (isbn ? `Unknown title (${isbn})` : "Unknown title"));
 
         // NOTE: Property names must match your Notion database exactly.
         const properties: Record<string, unknown> = {
             Name: { title: [{ text: { content: title } }] },
-            ISBN: { rich_text: [{ text: { content: isbn } }] },
         };
 
-        if (book?.authors?.length && propertyNames.has("Authors")) {
-            properties.Authors = { rich_text: [{ text: { content: book.authors.join(", ") } }] };
+        if (isbn) {
+            properties.ISBN = { rich_text: [{ text: { content: isbn } }] };
         }
 
-        const authorRelation = await buildAuthorRelationUpdate(book?.authors ?? [], {
+        if (effectiveAuthors.length && propertyNames.has("Authors")) {
+            properties.Authors = { rich_text: [{ text: { content: effectiveAuthors.join(", ") } }] };
+        }
+
+        const authorRelation = await buildAuthorRelationUpdate(effectiveAuthors, {
             dataSourceId,
             propertyNames,
             propertySchemas,
@@ -1247,15 +1685,19 @@ export async function POST(req: Request) {
             };
         }
 
-        if (book?.publisher && propertyNames.has("Publisher")) {
-            properties.Publisher = { rich_text: [{ text: { content: book.publisher } }] };
+        if (effectivePublisher && propertyNames.has("Publisher")) {
+            properties.Publisher = { rich_text: [{ text: { content: effectivePublisher } }] };
         }
-        if (book?.pageCount != null && propertyNames.has("Page Count")) {
-            properties["Page Count"] = { number: book.pageCount };
+        if (effectivePageCount != null && propertyNames.has("Page Count")) {
+            properties["Page Count"] = { number: effectivePageCount };
         }
-        if (book?.categories?.length && propertyNames.has("Categories")) {
+        if (effectiveCategories.length && propertyNames.has("Categories")) {
+            const syncedCategoryNames = resolveMultiSelectNamesAgainstSchema({
+                inputNames: effectiveCategories,
+                propertySchema: propertySchemas["Categories"],
+            });
             properties.Categories = {
-                multi_select: cleanCategories(book.categories),
+                multi_select: cleanCategories(syncedCategoryNames),
             };
         }
         if (book?.coverUrl && propertyNames.has("Cover URL")) {
@@ -1273,16 +1715,28 @@ export async function POST(req: Request) {
         if (book?.seriesNumber != null && propertyNames.has("Series Number")) {
             properties["Series Number"] = { number: book.seriesNumber };
         }
-        if (book?.sourceUrl && propertyNames.has("Source URL")) {
-            properties["Source URL"] = { url: book.sourceUrl };
+        if (effectiveSourceUrl && propertyNames.has("Source URL")) {
+            properties["Source URL"] = { url: effectiveSourceUrl };
         }
-        if (book?.description && propertyNames.has("Description")) {
+        if (effectiveDescription && propertyNames.has("Description")) {
             properties.Description = {
-                rich_text: [{ text: { content: book.description.slice(0, 2000) } }],
+                rich_text: [{ text: { content: effectiveDescription.slice(0, 2000) } }],
             };
         }
 
-        const published = notionDate(book?.publishedDate ?? null);
+        const editionProperty = resolvePropertyNameCaseInsensitive(
+            propertyNames,
+            process.env.NOTION_EDITION_PROPERTY ?? "Edition"
+        );
+        if (editionProperty && manualEdition) {
+            const editionSchemaType = getString(asRecord(propertySchemas[editionProperty])?.type);
+            const editionValue = buildTextLikeProperty(editionSchemaType, manualEdition);
+            if (editionValue) {
+                properties[editionProperty] = editionValue;
+            }
+        }
+
+        const published = notionDate(book?.publishedDate ?? manualPublishedDate ?? null);
         if (published && propertyNames.has("Published")) {
             properties.Published = { date: { start: published } };
         }
@@ -1317,9 +1771,9 @@ export async function POST(req: Request) {
                     ok: true,
                     code,
                     message,
-                    isbn,
+                    isbn: isbn ?? null,
                     title,
-                    firstAuthor: book?.authors?.[0] ?? null,
+                    firstAuthor: effectiveAuthors[0] ?? null,
                     exists: Boolean(existing),
                     requestId,
                     durationMs: Date.now() - startedAt,
@@ -1335,17 +1789,18 @@ export async function POST(req: Request) {
                     durationMs: Date.now() - startedAt,
                     timestamp: new Date().toISOString(),
                     data: {
-                        isbn,
+                        isbn: isbn ?? null,
                         title,
                         duplicated: Boolean(existing),
                         properties,
+                        manualMode,
                         dryRun: true,
                     },
                 };
             await writeAuditEvent({
                 requestId,
                 route: "/api/scan",
-                isbn,
+                isbn: isbn ?? null,
                 action: "dry_run",
                 status,
                 code,
@@ -1408,9 +1863,9 @@ export async function POST(req: Request) {
                 ok: true,
                 code: existing ? "BOOK_UPDATED" : "BOOK_CREATED",
                 message,
-                isbn,
+                isbn: isbn ?? null,
                 title,
-                firstAuthor: book?.authors?.[0] ?? null,
+                firstAuthor: effectiveAuthors[0] ?? null,
                 notionUrl: url,
                 exists: Boolean(existing),
                 speechText,
@@ -1432,17 +1887,19 @@ export async function POST(req: Request) {
                         data: {
                             isbn,
                             title,
-                            authors: book?.authors ?? [],
-                            publisher: book?.publisher ?? null,
-                            publishedDate: book?.publishedDate ?? null,
-                            pageCount: book?.pageCount ?? null,
-                            categories: book?.categories ?? [],
+                            authors: effectiveAuthors,
+                            publisher: effectivePublisher,
+                            publishedDate: book?.publishedDate ?? manualPublishedDate ?? null,
+                            pageCount: effectivePageCount,
+                            categories: effectiveCategories,
+                            edition: manualEdition,
                             coverSource: book?.coverSource ?? null,
                             metadataFound,
                             notes,
                             duplicated: false,
                             onDuplicate,
                             checkOnly: false,
+                            manualMode,
                             provider: book?.provider ?? null,
                             openLibraryWorkKey: book?.openLibraryWorkKey ?? null,
                             series: book?.series ?? null,
@@ -1479,7 +1936,7 @@ export async function POST(req: Request) {
             },
         });
 
-        if (enrichAsync && pageId) {
+        if (enrichAsync && pageId && isbn) {
             setTimeout(async () => {
                 try {
                     const refreshed = await fetchBookMetadataByIsbn(isbn);
